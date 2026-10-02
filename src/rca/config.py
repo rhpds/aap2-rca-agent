@@ -25,6 +25,20 @@ DATABASE_ENV_KEYS = {
 }
 
 _ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+DEFAULT_MAX_PARALLEL_JOBS = 5
+
+
+def _positive_int_environment_value(env: Mapping[str, str], key: str, default: int) -> int:
+    value = env.get(key, str(default))
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} must be a positive integer") from exc
+    if parsed < 1:
+        raise ValueError(f"{key} must be a positive integer")
+    return parsed
+
+
 def _settings_path(
     environment: Mapping[str, str],
     settings_file: str | Path | None,
@@ -196,6 +210,7 @@ class Config:
     jumpbox_uri: str
     ssh_jumpbox_alias: str
     bastion_ssh_user: str
+    max_parallel_jobs: int
 
     @classmethod
     def from_env(
@@ -234,6 +249,9 @@ class Config:
 
         job_logs_dir = _none_if_empty(env.get("JOB_LOGS_DIR"))
         state_dir = Path(env.get("RCA_STATE_DIR", str(Path.home() / ".rca"))).expanduser()
+        max_parallel_jobs = _positive_int_environment_value(
+            env, "RCA_MAX_PARALLEL_JOBS", DEFAULT_MAX_PARALLEL_JOBS
+        )
         return cls(
             environment=env,
             database=database,
@@ -246,6 +264,7 @@ class Config:
             jumpbox_uri=env.get("JUMPBOX_URI", ""),
             ssh_jumpbox_alias=env.get("SSH_JUMPBOX_ALIAS", "rca-jumpbox"),
             bastion_ssh_user=env.get("BASTION_SSH_USER", ""),
+            max_parallel_jobs=max_parallel_jobs,
         )
 
     @property

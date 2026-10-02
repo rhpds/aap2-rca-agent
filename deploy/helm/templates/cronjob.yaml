@@ -61,12 +61,10 @@ spec:
               cp /tmp/gcp-creds/application_default_credentials.json /workspace/.config/gcloud/application_default_credentials.json
               {{- end }}
 
-              echo "[INIT] Installing skill files and legacy batch entry script..."
+              echo "[INIT] Installing root-cause-analysis Skill..."
               mkdir -p /workspace/.claude/skills
               rsync -a --exclude='.analysis' --exclude='__pycache__' --exclude='*.pyc' --exclude='tests' --exclude='README.md' \
                 /opt/app/skills/ /workspace/.claude/skills/
-              cp /opt/app/deploy/batch-rca-automation/batch_rca_headless.sh /workspace/batch_rca_headless.sh
-              chmod +x /workspace/batch_rca_headless.sh
               echo "[INIT] Skills installed: $(ls /workspace/.claude/skills/ | tr '\n' ' ')"
             volumeMounts:
             - name: workspace
@@ -89,6 +87,7 @@ spec:
             - /bin/bash
             - -c
             - |
+              set -euo pipefail
               cd /workspace
               echo "[INFO] Starting SSH tunnel to database..."
               DB_REMOTE_HOST=$(cat /tmp/ssh-secret/db-remote-host)
@@ -96,7 +95,7 @@ spec:
               ssh -f -N -L 15432:${DB_REMOTE_HOST}:${DB_REMOTE_PORT} aap2-bastion
               echo "[INFO] SSH tunnel established on localhost:15432"
               SINCE=$(date -u -d "{{ .Values.cronjob.since }} ago" "+%Y-%m-%d %H:%M:%S")
-              ./batch_rca_headless.sh --limit {{ .Values.cronjob.limit }} --since "$SINCE"
+              rca-batch --limit {{ .Values.cronjob.limit }} --since "$SINCE"
             env:
             {{- if eq .Values.claude.backend "litellm" }}
             - name: ANTHROPIC_BASE_URL
@@ -135,8 +134,8 @@ spec:
               value: /workspace/.rca
             - name: RCA_SETTINGS_FILE
               value: /workspace/.claude/settings.json
-            - name: RCA_LEGACY_BATCH_SCRIPT
-              value: /workspace/batch_rca_headless.sh
+            - name: RCA_MAX_PARALLEL_JOBS
+              value: {{ .Values.cronjob.maxParallelJobs | default 5 | quote }}
             resources:
               requests:
                 cpu: {{ .Values.resources.requests.cpu }}

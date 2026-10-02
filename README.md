@@ -1,41 +1,40 @@
 # aap2-rca-agent
 
 Automated root-cause analysis for failed Ansible Automation Platform (AAP)
-jobs on the Red Hat Demo Platform (RHDP). The installable Python package
-contains the analysis and database helpers used by the current Claude Code
-Skill and headless batch workflow.
+jobs on the Red Hat Demo Platform (RHDP). The Python package runs the batch
+workflow and deterministic analysis; the existing on-disk Claude Code Skill
+still provides per-job RCA guidance.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    Start([OpenShift CronJob]) --> Shell[batch_rca_headless.sh]
-    Shell --> Settings[Load Claude settings and options]
-    Settings --> Query[Query unprocessed jobs from PostgreSQL]
+    Start([OpenShift CronJob]) --> Runner[rca-batch]
+    Runner --> Query[Query unprocessed jobs from PostgreSQL]
     Query --> AnyJobs{Jobs found?}
     AnyJobs -- No --> Done([Exit successfully])
     AnyJobs -- Yes --> Dedup[Intra-batch dedup]
     Dedup --> Known[Load recent high-confidence issues]
     Known --> Filter{Known-issue pre-filter enabled?}
     Filter -- Yes --> Prefilter[Match by catalog and error similarity]
-    Filter -- No --> Claude
+    Filter -- No --> Analysis
     Prefilter --> Matched[Store pre-matched jobs]
-    Prefilter --> Claude[claude -p batch coordinator]
-    Claude --> Agents[Parallel root-cause-analysis Skill agents]
-    Agents --> Steps[Run deterministic analysis and Step 5 synthesis]
+    Prefilter --> Analysis[Bounded parallel Python analysis]
     subgraph PerJob[Per-job analysis]
       Parse[Parse AAP job log]
       Splunk[Query Splunk]
       Correlation[Build correlation timeline]
       GitHub[Fetch AgnosticV config and AgnosticD code]
-      Synthesis[Claude synthesis and jumpbox upload]
-      Parse --> Splunk --> Correlation --> GitHub --> Synthesis
+      Synthesis[Agent SDK invokes root-cause-analysis Skill]
+      Upload[Upload analysis to Jumpbox]
+      Parse --> Splunk --> Correlation --> GitHub --> Synthesis --> Upload
     end
-    Steps --> Parse
-    Synthesis --> Aggregate[Aggregate the batch report]
+    Analysis --> Parse
+    Upload --> Aggregate[Aggregate the batch report]
     Aggregate --> Write[Write report JSON]
     Write --> Store[Store results and link duplicates]
-    Store --> Done
+    Store --> Jira[Step 6 placeholder: no Jira tickets created]
+    Jira --> Done
 ```
 
 ## Installable Python package
@@ -43,7 +42,8 @@ flowchart TD
 The source tree uses the `src/rca` package layout. Runtime dependencies and
 console entry points are declared in `pyproject.toml`; reusable modules are
 installed once rather than copied into separate `common/` and batch-script
-trees. The on-disk Skill and shell coordinator remain in place in this issue.
+trees. `rca-batch` is the Python Agent SDK batch coordinator. The existing
+on-disk Skill remains in place and is copied into the CronJob workspace.
 
 ```bash
 python3 -m venv .venv
@@ -62,17 +62,21 @@ rca-analyze status 1234567
 rca-analyze upload --job-id 1234567
 ```
 
-The CronJob continues to use `batch_rca_headless.sh`. Its Python helper steps
-run as `python -m rca.batch.<module>` from the installed package. The
-`rca-batch` console entry is a compatibility wrapper for that shell runner;
-its Python replacement is a separate issue.
+The CronJob runs `rca-batch` directly. The legacy
+`deploy/batch-rca-automation/batch_rca_headless.sh` path remains as a thin
+compatibility wrapper that forwards arguments to `rca-batch`.
 
-For a local batch run, point the wrapper at the legacy shell script:
+For a local batch run (after installing the package and configuring the
+required settings):
 
 ```bash
-RCA_LEGACY_BATCH_SCRIPT=deploy/batch-rca-automation/batch_rca_headless.sh \
-  rca-batch --limit 15 --since '2026-09-30 12:00:00'
+rca-batch --limit 15
 ```
+
+Use `--no-pre-filter` to skip matching jobs against recent known issues.
+`RCA_MAX_PARALLEL_JOBS` sets the bound for parallel job pipelines and Agent SDK
+queries (default `5`). The Step 6 Jira ticket preparation hook is intentionally
+a no-op for now; no Jira integration or ticket creation is performed.
 
 ## Configuration and state
 
@@ -89,6 +93,7 @@ Important settings include:
 - `SPLUNK_*` and `GITHUB_TOKEN` for deterministic enrichment.
 - `JUMPBOX_URI` for uploading completed analysis.
 - `RCA_STATE_DIR` (default `~/.rca`) for writable reports and analysis state.
+- `RCA_MAX_PARALLEL_JOBS` for bounded batch concurrency (default `5`).
 
 Batch reports are written to `$RCA_STATE_DIR/reports/`. Per-job artifacts are
 stored under `$RCA_STATE_DIR/.analysis/{job_id}/`. JSON schemas are included as
@@ -145,10 +150,9 @@ the Step 5 analysis summary.
 
 ## Deployment and tests
 
-The Docker image uses `python:3.12-slim` and installs the package. The bundled
-Claude CLI binary is exposed for the existing shell runner without installing
-Node. The CronJob still installs the on-disk Skill and prepares SSH/GCP
-credentials in its init container.
+The Docker image uses `python:3.12-slim` and installs the package, including
+the pinned Claude Agent SDK. The CronJob installs the on-disk Skill and
+prepares SSH/GCP credentials in its init container before running `rca-batch`.
 
 ```bash
 .venv/bin/pytest

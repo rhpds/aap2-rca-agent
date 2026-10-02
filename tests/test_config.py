@@ -52,6 +52,19 @@ def test_config_defaults(tmp_path: Path) -> None:
     assert config.splunk.ocp_app_index is None
     assert config.splunk.ocp_infra_index is None
     assert config.job_logs_dir is None
+    assert config.max_parallel_jobs == 5
+
+
+def test_config_parses_max_parallel_jobs(tmp_path: Path) -> None:
+    config = _config(tmp_path, RCA_MAX_PARALLEL_JOBS="3")
+
+    assert config.max_parallel_jobs == 3
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-an-integer", "1.5"])
+def test_config_rejects_invalid_max_parallel_jobs(tmp_path: Path, value: str) -> None:
+    with pytest.raises(ValueError, match="RCA_MAX_PARALLEL_JOBS must be a positive integer"):
+        _config(tmp_path, RCA_MAX_PARALLEL_JOBS=value)
 
 
 def test_source_database_is_opt_in_when_host_is_not_configured(tmp_path: Path) -> None:

@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from rca.database import lookup_job_bastion_row
+from rca.database import lookup_job_bastion_row, pooled_connection
 from rca.ssh import (
     ensure_bastion_host as ensure_ssh_bastion_host,
     ensure_jumpbox_alias as ensure_ssh_jumpbox_alias,
@@ -69,9 +69,11 @@ def ensure_bastion_host(
     )
 
 
-def lookup_job_bastion(config: Config, job_id: str) -> BastionTarget | None:
+def lookup_job_bastion(
+    config: Config, job_id: str, *, conn: object | None = None
+) -> BastionTarget | None:
     """Look up cluster and bastion mapping for a job from the source database."""
-    if not config.has_source_db():
+    if conn is None and not config.has_source_db():
         return None
 
     db_config = {
@@ -83,7 +85,10 @@ def lookup_job_bastion(config: Config, job_id: str) -> BastionTarget | None:
         "source_table": config.source_db_table,
         "bastion_table": config.source_db_bastion_table,
     }
-    row = lookup_job_bastion_row(db_config, job_id)
+    if conn is None:
+        row = lookup_job_bastion_row(db_config, job_id)
+    else:
+        row = lookup_job_bastion_row(db_config, job_id, conn=conn)
     if not row:
         return None
 
@@ -103,9 +108,15 @@ def lookup_job_bastion(config: Config, job_id: str) -> BastionTarget | None:
     )
 
 
-def resolve_bastion_for_job(config: Config, job_id: str) -> BastionTarget:
+def resolve_bastion_for_job(
+    config: Config, job_id: str, *, db_pool: object | None = None
+) -> BastionTarget:
     """Resolve the SSH host alias to use when fetching a job log."""
-    target = lookup_job_bastion(config, job_id)
+    if db_pool is None:
+        target = lookup_job_bastion(config, job_id)
+    else:
+        with pooled_connection(db_pool) as conn:
+            target = lookup_job_bastion(config, job_id, conn=conn)
     if target:
         return target
 

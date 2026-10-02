@@ -71,6 +71,7 @@ def _resolve_job_log(
     job_id: str | None,
     job_log: str | Path | None,
     fetch: bool,
+    db_pool: Any | None = None,
 ) -> tuple[Path, str | None]:
     if fetch and not job_id:
         raise AnalysisPipelineError("--fetch requires --job-id (it has no effect with --job-log)")
@@ -98,7 +99,10 @@ def _resolve_job_log(
 
     logger.info("[Fetch] Resolving bastion and retrieving log for job_id=%s", job_id)
     try:
-        target = resolve_bastion_for_job(config, job_id)
+        if db_pool is None:
+            target = resolve_bastion_for_job(config, job_id)
+        else:
+            target = resolve_bastion_for_job(config, job_id, db_pool=db_pool)
         prepare_bastion_for_fetch(config, target)
         remote_dir = resolve_remote_log_dir(target, config)
         fetched_files = fetch_job_log(job_id, config.job_logs_dir, target.remote_host, remote_dir)
@@ -126,6 +130,7 @@ def run_analysis(
     job_id: str | None = None,
     job_log: str | Path | None = None,
     fetch: bool = False,
+    db_pool: Any | None = None,
 ) -> AnalysisArtifacts:
     """Run steps 1–4 and return their artifacts for the caller."""
     job_log_path, requested_job_id = _resolve_job_log(
@@ -133,6 +138,7 @@ def run_analysis(
         job_id=job_id,
         job_log=job_log,
         fetch=fetch,
+        db_pool=db_pool,
     )
     try:
         job_context = parse_job_log(job_log_path)

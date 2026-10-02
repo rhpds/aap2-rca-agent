@@ -8,6 +8,7 @@ import glob
 import json
 import os
 import sys
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -38,7 +39,12 @@ def find_match(cur: Any, results_table: str, job: dict[str, Any]) -> int | None:
         (job.get("root_cause_category"), job.get("catalog_item"), cutoff_batch_id),
     )
     summary = job.get("root_cause_summary", "")
-    for row_id, existing_summary in cur.fetchall():
+    for row in cur.fetchall():
+        if isinstance(row, Mapping):
+            row_id = row["id"]
+            existing_summary = row["root_cause_summary"]
+        else:
+            row_id, existing_summary = row
         ratio = difflib.SequenceMatcher(None, summary, existing_summary).ratio()
         if ratio >= MATCH_THRESHOLD:
             print(f"[MATCH] job {job.get('job_id')} ({ratio:.0%}) -> result {row_id}")
@@ -127,7 +133,7 @@ def store_report(
                     ),
                 )
                 row = cur.fetchone()
-                new_id = row[0] if row else None
+                new_id = (row["id"] if isinstance(row, Mapping) else row[0]) if row else None
 
                 if status in ("analyzed", "matched_known_issue"):
                     cur.execute(
@@ -184,14 +190,16 @@ def link_intra_batch_dupes(
                 (rep_id,),
             )
             row = cur.fetchone()
-            if not row or row[0] is None:
+            fk_id = (
+                row.get("aap2_job_results_fk_id") if isinstance(row, Mapping) else row[0]
+            ) if row else None
+            if fk_id is None:
                 print(
                     f"[WARN] intra-batch dupe {dupe_id}: representative {rep_id} has no FK yet",
                     file=sys.stderr,
                 )
                 continue
 
-            fk_id = row[0]
             cur.execute(
                 psycopg2.sql.SQL(
                     """UPDATE {} SET aap2_job_results_fk_id = %s, ai_processed = TRUE

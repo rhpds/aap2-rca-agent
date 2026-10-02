@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
 from collections.abc import Mapping
 from typing import Any
 
@@ -31,7 +32,37 @@ def connect_db(config: Mapping[str, Any], *, use_dict_cursor: bool = False) -> A
     return psycopg2.connect(**kwargs)
 
 
-def lookup_job_bastion_row(config: Mapping[str, Any], job_id: str) -> dict[str, Any] | None:
+@contextmanager
+def pooled_connection(pool: Any):
+    """Borrow one connection from a psycopg2 pool and return it cleanly.
+
+    Batch queries share a ``ThreadedConnectionPool``. A borrowed connection is
+    never shared between concurrent workers, and any read-only transaction left
+    open by a helper is rolled back before the connection is returned.
+    """
+    conn = pool.getconn()
+    try:
+        yield conn
+    except BaseException:
+        _return_pooled_connection(pool, conn)
+        raise
+    else:
+        _return_pooled_connection(pool, conn)
+
+
+def _return_pooled_connection(pool: Any, conn: Any) -> None:
+    close = bool(getattr(conn, "closed", False))
+    if not close:
+        try:
+            conn.rollback()
+        except Exception:
+            close = True
+    pool.putconn(conn, close=close)
+
+
+def lookup_job_bastion_row(
+    config: Mapping[str, Any], job_id: str, *, conn: Any | None = None
+) -> dict[str, Any] | None:
     """Fetch the source event's cluster-to-bastion mapping for one AAP job."""
     query = psycopg2.sql.SQL(
         "SELECT e.job_id, e.cluster_name, u.bastion_hostname, u.bastion_ssh_port, "
@@ -46,14 +77,17 @@ def lookup_job_bastion_row(config: Mapping[str, Any], job_id: str) -> dict[str, 
         psycopg2.sql.Identifier(config["bastion_table"]),
     )
 
-    conn = connect_db(config, use_dict_cursor=True)
+    owns_connection = conn is None
+    if owns_connection:
+        conn = connect_db(config, use_dict_cursor=True)
     try:
         with conn.cursor() as cur:
             cur.execute(query, (job_id,))
             row = cur.fetchone()
             return dict(row) if row else None
     finally:
-        conn.close()
+        if owns_connection:
+            conn.close()
 
 
 def _has_ticket_columns(conn: Any, table: str) -> bool:

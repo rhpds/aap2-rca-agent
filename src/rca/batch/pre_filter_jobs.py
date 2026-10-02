@@ -161,13 +161,68 @@ def filter_jobs(
                     "catalog_item": result["catalog_item"],
                     "root_cause_category": result["root_cause_category"],
                     "match_reason": match_reason,
-                    "recent_result_summary": result["root_cause_summary"][:200],
+                    "recent_result_summary": str(result.get("root_cause_summary") or "")[:200],
                 }
             )
         else:
             analyze.append(job_id)
 
     return analyze, matched
+
+
+def filter_against_known_issues(
+    conn: Any,
+    results_table: str,
+    source_table: str,
+    job_ids: list[int],
+    lookback_hours: int = 4,
+) -> dict[str, list[Any]]:
+    """Split incoming jobs into jobs needing RCA and matches to recent issues.
+
+    This is the connection-injected counterpart to the command-line flow below,
+    used by the Python batch orchestrator so filtering shares its DB connection
+    pool rather than opening another database connection.
+    """
+    if not job_ids:
+        return {"analyze": [], "pre_matched": []}
+
+    recent_results, job_metadata = fetch_filter_context(
+        conn,
+        results_table,
+        source_table,
+        job_ids,
+        lookback_hours,
+    )
+    catalog_index = build_catalog_index(recent_results) if recent_results else {}
+    category_index = build_category_index(recent_results) if recent_results else {}
+
+    known_job_ids = [job_id for job_id in job_ids if job_id in job_metadata]
+    unknown_job_ids = [job_id for job_id in job_ids if job_id not in job_metadata]
+
+    # First match by catalog item and error text. Jobs with missing metadata are
+    # retained for full analysis rather than accidentally discarded.
+    analyze, pre_matched = filter_jobs(
+        known_job_ids,
+        job_metadata,
+        _catalog_matcher(catalog_index),
+        "pre_filter_catalog_item+error_message",
+    )
+    analyze.extend(unknown_job_ids)
+
+    # Then allow a strong exact-error similarity match across catalog items,
+    # which catches platform-level failures shared by different workloads.
+    analyze, cross_matched = filter_jobs(
+        analyze,
+        job_metadata,
+        _cross_catalog_matcher(category_index),
+        "cross_catalog_error_message",
+    )
+    analyze_set = set(analyze)
+    analyze = [job_id for job_id in job_ids if job_id in analyze_set]
+    original_order = {job_id: index for index, job_id in enumerate(job_ids)}
+    pre_matched.extend(cross_matched)
+    pre_matched.sort(key=lambda match: original_order.get(match["job_id"], len(job_ids)))
+    return {"analyze": analyze, "pre_matched": pre_matched}
 
 
 def _catalog_matcher(
@@ -343,8 +398,9 @@ def main(argv: list[str] | None = None) -> int:
             unknown_ids = [jid for jid in job_ids if jid not in job_metadata]
 
             # First pass: match by catalog_item + error similarity
+            known_job_ids = [jid for jid in job_ids if jid in job_metadata]
             analyze, pre_matched = filter_jobs(
-                list(job_metadata.keys()),
+                known_job_ids,
                 job_metadata,
                 _catalog_matcher(catalog_index),
                 "pre_filter_catalog_item+error_message",

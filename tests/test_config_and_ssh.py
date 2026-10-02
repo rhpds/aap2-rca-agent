@@ -5,8 +5,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from rca.analysis import bastion_resolver
 from rca import database
-from rca.config import load_database_config
+from rca.config import Config, load_database_config
 from rca.ssh import (
     append_ssh_host_block,
     ensure_bastion_host,
@@ -74,6 +75,46 @@ def test_lookup_job_bastion_row_uses_shared_connection_and_closes_it(
     cursor.execute.assert_called_once()
     assert cursor.execute.call_args.args[1] == ("123",)
     connection.close.assert_called_once_with()
+
+
+def test_pool_bastion_lookup_works_without_configured_host(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = Config.from_env(
+        environment={
+            "SOURCE_DB_NAME": "rca",
+            "SOURCE_DB_USER": "agent",
+            "SOURCE_DB_PASSWORD": "secret",
+        },
+        env_file=tmp_path / "missing.env",
+    )
+    assert config.has_source_db() is False
+
+    connection = MagicMock()
+    connection.closed = 0
+    pool = MagicMock()
+    pool.getconn.return_value = connection
+    row = {
+        "job_id": 123,
+        "cluster_name": "cluster-a",
+        "bastion_hostname": "bastion.example.com",
+        "bastion_ssh_port": 2200,
+        "instance_base_path": "/srv/instances",
+    }
+    lookup = MagicMock(return_value=row)
+    monkeypatch.setattr(bastion_resolver, "lookup_job_bastion_row", lookup)
+
+    target = bastion_resolver.resolve_bastion_for_job(config, "123", db_pool=pool)
+
+    assert target.remote_host == "bastion-cluster-a"
+    assert target.remote_log_dir == "/srv/instances"
+    assert target.bastion_hostname == "bastion.example.com"
+    assert target.bastion_ssh_port == 2200
+    assert lookup.call_args.args[0]["host"] == ""
+    assert lookup.call_args.args[1] == "123"
+    assert lookup.call_args.kwargs["conn"] is connection
+    pool.putconn.assert_called_once_with(connection, close=False)
+    connection.rollback.assert_called_once_with()
 
 
 def test_parse_jumpbox_uri() -> None:

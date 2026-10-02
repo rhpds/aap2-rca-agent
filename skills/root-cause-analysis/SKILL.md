@@ -186,7 +186,7 @@ python scripts/cli.py upload --job-id <job-id>
 
 ### Summary Requirements
 
-1. **Root Cause**: Category (`configuration|infrastructure|workload_bug|credential|resource|dependency`), summary, confidence
+1. **Root Cause**: Category (`application_bug|infrastructure|configuration|dependency|network|resource|cloud_api|secrets|unknown`), summary, confidence. Use `application_bug` for workload bugs and `secrets` for credential failures.
 2. **Evidence**: Supporting evidence from AAP logs, Splunk logs, and GitHub configs/code
    - **REQUIRED**: When `source` is `agnosticv_config` or `agnosticd_code`, **MUST** include `github_path` in format `owner/repo:path/to/file.yml:line`
    - Extract GitHub paths from step4:
