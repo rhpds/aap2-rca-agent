@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 dependencies = [
     "claude-agent-sdk==0.2.162",
     "jsonschema>=4.0",
-    "mlflow==3.11.1",
+    "mlflow==3.16.0",
     "psycopg2-binary>=2.9.0",
     "python-dotenv>=1.0.0",
     "PyYAML>=6.0",
