@@ -28,14 +28,15 @@ from rca.analysis.jumpbox_io import upload_to_jumpbox
 from rca.analysis.pipeline import AnalysisArtifacts, run_analysis
 from rca.batch.fetch_known_issues import fetch_known_issues
 from rca.batch.pre_filter_jobs import (
-    dedup_batch,
     fetch_job_metadata,
-    filter_against_known_issues,
+    fetch_recent_results,
+    pre_matched_entries,
+    pre_analysis_gate,
 )
 from rca.batch.query_source_db import query_job_ids
 from rca.batch.store_report import (
     link_intra_batch_dupes,
-    store_cross_patterns,
+    post_analysis_link,
     store_pre_matched,
     store_report,
 )
@@ -1074,7 +1075,7 @@ def _store_batch_report(
         stored = store_report(conn, database, report, filename=str(report_path))
         if not stored:
             return False
-        store_cross_patterns(conn, database, report)
+        post_analysis_link(conn, database, report)
     if dupes:
         try:
             with pooled_connection(pool) as conn:
@@ -1082,6 +1083,54 @@ def _store_batch_report(
         except psycopg2.Error as exc:
             logger.warning("Could not link intra-batch duplicate jobs: %s", exc)
     return True
+
+
+def _recover_failed_representatives(
+    executions: list[JobExecution],
+    dupes: list[dict[str, Any]],
+    skipped_job_ids: set[int],
+    config: Config,
+    pool: Any,
+    *,
+    cwd: Path,
+) -> tuple[list[JobExecution], list[dict[str, Any]]]:
+    """Analyze another duplicate when its representative fails."""
+
+    failed_representatives = {
+        execution.job_id for execution in executions if execution.status != "completed"
+    }
+    if not failed_representatives or not dupes:
+        return executions, dupes
+
+    candidates_by_representative: dict[str, list[int]] = defaultdict(list)
+    for entry in dupes:
+        representative = str(entry["representative_job_id"])
+        candidate = int(entry["job_id"])
+        if representative in failed_representatives and candidate not in skipped_job_ids:
+            candidates_by_representative[representative].append(candidate)
+
+    for representative, candidates in candidates_by_representative.items():
+        candidates.sort()
+        for candidate in candidates:
+            logger.warning(
+                "Representative job %s failed; retrying duplicate job %s",
+                representative,
+                candidate,
+            )
+            recovered = asyncio.run(
+                _analyze_jobs([candidate], config, pool, cwd=cwd)
+            )
+            executions.extend(recovered)
+            if recovered and recovered[0].status == "completed":
+                for entry in dupes:
+                    if str(entry["representative_job_id"]) == representative:
+                        entry["representative_job_id"] = candidate
+                dupes = [
+                    entry for entry in dupes if int(entry["job_id"]) != candidate
+                ]
+                break
+
+    return executions, dupes
 
 
 def _run_agent_batch(
@@ -1166,14 +1215,39 @@ def run_batch(
             return 0
 
         logger.info("Found %d job(s): %s", len(job_ids), ", ".join(map(str, job_ids)))
-        logger.info("[STEP 1a] Deduplicating within batch")
+        logger.info("[STEP 1a] Running unified pre-analysis gate")
         try:
             with pooled_connection(pool) as conn:
                 metadata = fetch_job_metadata(conn, database["source_table"], job_ids)
-            representative_ids, dupes = dedup_batch(job_ids, metadata)
         except psycopg2.Error as exc:
-            logger.warning("Could not deduplicate jobs; analyzing all queried IDs: %s", exc)
-            representative_ids, dupes = list(job_ids), []
+            logger.warning("Could not load job metadata; analyzing all queried IDs: %s", exc)
+            metadata = {}
+
+        recent_results: list[dict[str, Any]] = []
+        if no_pre_filter:
+            logger.info("[STEP 1b] Historical pre-filter disabled (--no-pre-filter)")
+        else:
+            try:
+                with pooled_connection(pool) as conn:
+                    recent_results = fetch_recent_results(
+                        conn,
+                        database["results_table"],
+                        database["source_table"],
+                        lookback_hours=DEFAULT_LOOKBACK_HOURS,
+                    )
+            except psycopg2.Error as exc:
+                logger.warning("Could not load pre-filter history; continuing with dedup only: %s", exc)
+
+        try:
+            analyze_ids, skip_targets, dupes = pre_analysis_gate(
+                job_ids,
+                metadata,
+                recent_results,
+                use_history=not no_pre_filter,
+            )
+        except ValueError as exc:
+            logger.warning("Pre-analysis gate failed; analyzing all jobs: %s", exc)
+            analyze_ids, skip_targets, dupes = list(job_ids), {}, []
 
         known_issues: list[dict[str, Any]] = []
         try:
@@ -1187,29 +1261,27 @@ def run_batch(
         except psycopg2.Error as exc:
             logger.warning("Could not load recent known issues; continuing without them: %s", exc)
 
-        analyze_ids = list(representative_ids)
         pre_matched: list[dict[str, Any]] = []
-        if no_pre_filter:
-            logger.info("[STEP 1b] Pre-filter disabled (--no-pre-filter)")
+        if skip_targets:
+            pre_matched = pre_matched_entries(
+                skip_targets,
+                recent_results,
+                job_ids,
+            )
+            logger.info(
+                "[STEP 1b] Pre-analysis gate matched %d job(s); %d job(s) require analysis",
+                len(pre_matched),
+                len(analyze_ids),
+            )
         elif known_issues:
             logger.info(
-                "[STEP 1b] Pre-filtering %d job(s) against %d known issue(s)",
-                len(representative_ids),
+                "[STEP 1b] Pre-analysis gate matched 0 job(s); %d job(s) require analysis",
+                len(analyze_ids),
+            )
+            logger.debug(
+                "Loaded %d known issue(s) for post-analysis semantic matching",
                 len(known_issues),
             )
-            try:
-                with pooled_connection(pool) as conn:
-                    filter_result = filter_against_known_issues(
-                        conn,
-                        database["results_table"],
-                        database["source_table"],
-                        representative_ids,
-                        lookback_hours=DEFAULT_LOOKBACK_HOURS,
-                    )
-                analyze_ids = filter_result["analyze"]
-                pre_matched = filter_result["pre_matched"]
-            except psycopg2.Error as exc:
-                logger.warning("Pre-filter failed; analyzing unmatched jobs normally: %s", exc)
 
         if pre_matched:
             logger.info("Pre-filter matched %d job(s)", len(pre_matched))
@@ -1235,6 +1307,14 @@ def run_batch(
         logger.info("[STEP 2] Running deterministic analysis and Skill-based RCA for %d job(s)", len(analyze_ids))
         agent_spawn = _utc_now().isoformat().replace("+00:00", "Z")
         executions = asyncio.run(_analyze_jobs(analyze_ids, config, pool, cwd=working_dir))
+        executions, dupes = _recover_failed_representatives(
+            executions,
+            dupes,
+            set(skip_targets),
+            config,
+            pool,
+            cwd=working_dir,
+        )
         report_summaries, cross_patterns, aggregation_result = _run_agent_batch(
             executions,
             known_issues,

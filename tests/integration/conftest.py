@@ -28,9 +28,16 @@ CREATE TABLE {RESULTS_TABLE} (
     status TEXT NOT NULL,
     catalog_item TEXT,
     root_cause_category TEXT,
+    cross_job_pattern TEXT,
+    cross_job_pattern_description TEXT,
+    cross_job_pattern_confidence TEXT
+        CHECK (cross_job_pattern_confidence IN ('high', 'medium', 'low')),
     ticket_link TEXT,
     ticket_resolve_datetime_gmt TIMESTAMPTZ
 );
+
+CREATE INDEX aap2_job_results_cross_job_pattern_idx
+    ON aap2_job_results(cross_job_pattern);
 """
 
 

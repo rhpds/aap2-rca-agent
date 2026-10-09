@@ -2,8 +2,6 @@
 
 from unittest.mock import MagicMock
 
-from psycopg2 import sql
-
 from rca.batch import store_report
 
 
@@ -16,38 +14,7 @@ def _connection_and_cursor():
     return connection, cursor
 
 
-def test_find_match_accepts_mapping_rows(monkeypatch) -> None:
-    monkeypatch.setattr(
-        store_report,
-        "known_issue_active_sql",
-        lambda _conn, *, table: sql.SQL("TRUE"),
-    )
-    cursor = MagicMock()
-    cursor.connection = MagicMock()
-    cursor.fetchall.return_value = [
-        {"id": 42, "root_cause_summary": "A worker ran out of capacity"}
-    ]
-
-    match_id = store_report.find_match(
-        cursor,
-        "results",
-        {
-            "job_id": "123",
-            "root_cause_category": "infrastructure",
-            "catalog_item": "widget",
-            "root_cause_summary": "A worker ran out of capacity",
-        },
-    )
-
-    assert match_id == 42
-
-
-def test_store_report_reads_mapping_insert_result(monkeypatch) -> None:
-    monkeypatch.setattr(
-        store_report,
-        "known_issue_active_sql",
-        lambda _conn, *, table: sql.SQL("TRUE"),
-    )
+def test_store_report_reads_mapping_insert_result() -> None:
     connection, cursor = _connection_and_cursor()
     cursor.fetchall.return_value = []
     cursor.fetchone.return_value = {"id": 55}
@@ -65,12 +32,20 @@ def test_store_report_reads_mapping_insert_result(monkeypatch) -> None:
                     "root_cause_summary": "A worker ran out of capacity",
                     "confidence": "high",
                     "catalog_item": "widget",
+                    "historical_matches": [
+                        {
+                            "matched_result_id": 99,
+                            "similarity_reasoning": "Same worker capacity issue.",
+                            "confidence": "high",
+                        }
+                    ],
                 }
             ],
         },
     )
 
     assert (55, "123") in [call.args[1] for call in cursor.execute.call_args_list]
+    assert (99, "123") not in [call.args[1] for call in cursor.execute.call_args_list]
     connection.commit.assert_called_once_with()
 
 
@@ -89,12 +64,7 @@ def test_link_intra_batch_dupes_reads_mapping_result_row() -> None:
     connection.commit.assert_called_once_with()
 
 
-def test_store_report_assigns_pattern_id_from_result_ids(monkeypatch) -> None:
-    monkeypatch.setattr(
-        store_report,
-        "known_issue_active_sql",
-        lambda _conn, *, table: sql.SQL("TRUE"),
-    )
+def test_store_report_assigns_pattern_id_from_result_ids() -> None:
     connection, cursor = _connection_and_cursor()
     cursor.fetchall.return_value = []
     cursor.fetchone.side_effect = [{"id": 12}, {"id": 11}]
@@ -126,13 +96,44 @@ def test_store_report_assigns_pattern_id_from_result_ids(monkeypatch) -> None:
     connection.commit.assert_called_once_with()
 
 
-def test_store_cross_patterns_persists_derived_pattern_id() -> None:
+def test_post_analysis_link_persists_derived_pattern_id() -> None:
     connection, cursor = _connection_and_cursor()
+    result_rows = [
+        {
+            "id": 42,
+            "catalog_item": "widget",
+            "root_cause_category": "infrastructure",
+            "root_cause_summary": "Worker 7 timed out.",
+            "cross_job_pattern": None,
+        },
+        {
+            "id": 43,
+            "catalog_item": "widget",
+            "root_cause_category": "infrastructure",
+            "root_cause_summary": "Worker 7 timed out.",
+            "cross_job_pattern": None,
+        },
+    ]
+    cursor.fetchone.side_effect = result_rows + result_rows
     report = {
         "batch_id": "batch_test",
         "job_summaries": [
-            {"job_id": "123", "status": "analyzed", "result_id": 42},
-            {"job_id": "124", "status": "analyzed", "result_id": 43},
+            {
+                "job_id": "123",
+                "status": "analyzed",
+                "result_id": 42,
+                "catalog_item": "widget",
+                "root_cause_category": "infrastructure",
+                "root_cause_summary": "Worker 7 timed out.",
+            },
+            {
+                "job_id": "124",
+                "status": "analyzed",
+                "result_id": 43,
+                "catalog_item": "widget",
+                "root_cause_category": "infrastructure",
+                "root_cause_summary": "Worker 7 timed out.",
+            },
         ],
         "cross_job_patterns": [
             {
@@ -141,13 +142,19 @@ def test_store_cross_patterns_persists_derived_pattern_id() -> None:
                 "description": "Both jobs time out in worker 7.",
                 "source": "current_batch",
                 "pattern_id": "42",
+                "confidence": "high",
             }
         ],
     }
 
-    store_report.store_cross_patterns(connection, {"results_table": "results"}, report)
+    store_report.post_analysis_link(connection, {"results_table": "results"}, report)
 
-    execute_params = [call.args[1] for call in cursor.execute.call_args_list]
-    assert ("42", "Both jobs time out in worker 7.", 42) in execute_params
-    assert ("42", "Both jobs time out in worker 7.", 43) in execute_params
+    update_params = [call.args[1] for call in cursor.execute.call_args_list if len(call.args) > 1]
+    assert any(
+        params[0] == "42"
+        and params[1] == [42, 43]
+        and params[3] == [42, 43]
+        and params[4] == "high"
+        for params in update_params
+    )
     connection.commit.assert_called_once_with()

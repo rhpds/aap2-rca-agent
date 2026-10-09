@@ -384,14 +384,30 @@ def test_batch_exit_status_preserves_reports_and_partial_success(
         for index, status in enumerate(statuses)
     ]
     pre_matched = [{"job_id": 103, "matched_result_id": 9}] if has_pre_match else []
+    skip_targets = {103: 9} if has_pre_match else {}
+    recent_results = [
+        {
+            "id": 9,
+            "catalog_item": "widget",
+            "root_cause_category": "infrastructure",
+            "root_cause_summary": "Known issue",
+        }
+    ]
     monkeypatch.setattr(orchestrator, "pooled_connection", lambda pool: nullcontext(object()))
     monkeypatch.setattr(orchestrator, "query_job_ids", Mock(return_value=[101, 102, 103]))
     monkeypatch.setattr(orchestrator, "fetch_job_metadata", Mock(return_value={}))
     monkeypatch.setattr(orchestrator, "fetch_known_issues", Mock(return_value=[{"result_id": 9}]))
+    monkeypatch.setattr(orchestrator, "fetch_recent_results", Mock(return_value=recent_results))
     monkeypatch.setattr(
         orchestrator,
-        "filter_against_known_issues",
-        Mock(return_value={"analyze": [int(item.job_id) for item in executions], "pre_matched": pre_matched}),
+        "pre_analysis_gate",
+        Mock(
+            return_value=(
+                [int(item.job_id) for item in executions],
+                skip_targets,
+                [],
+            )
+        ),
     )
     monkeypatch.setattr(orchestrator, "store_pre_matched", Mock())
     monkeypatch.setattr(orchestrator, "_analyze_jobs", AsyncMock(return_value=executions))
@@ -409,6 +425,51 @@ def test_batch_exit_status_preserves_reports_and_partial_success(
         assert store.call_args.args[3].is_file()
     else:
         store.assert_not_called()
+
+
+def test_failed_representative_falls_back_to_next_duplicate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    executions = [
+        orchestrator.JobExecution(
+            "100",
+            "failed",
+            1,
+            error="analysis failed",
+        )
+    ]
+    recovered = [
+        orchestrator.JobExecution(
+            "101",
+            "completed",
+            1,
+            summary={"root_cause": {"summary": "recovered"}},
+        )
+    ]
+    dupes = [
+        {"job_id": 101, "representative_job_id": 100},
+        {"job_id": 102, "representative_job_id": 100},
+    ]
+    monkeypatch.setattr(
+        orchestrator,
+        "_analyze_jobs",
+        AsyncMock(return_value=recovered),
+    )
+
+    executions, updated_dupes = orchestrator._recover_failed_representatives(
+        executions,
+        dupes,
+        set(),
+        config,
+        object(),
+        cwd=tmp_path,
+    )
+
+    assert [execution.job_id for execution in executions] == ["100", "101"]
+    assert executions[-1].job_id == "101"
+    assert updated_dupes == [{"job_id": 102, "representative_job_id": 101}]
 
 
 def test_normalize_semantics_validates_job_and_result_ids() -> None:

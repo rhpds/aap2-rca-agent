@@ -3,66 +3,20 @@
 from __future__ import annotations
 
 import argparse
-import difflib
 import glob
 import json
 import os
 import sys
 from collections.abc import Mapping
-from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import psycopg2
 import psycopg2.sql
 
 from rca.config import load_database_config
-from rca.database import connect_db, known_issue_active_sql
+from rca.database import connect_db
+from rca.batch.match import Confidence, MatchSignals, score_similarity, weakest_confidence
 
-MATCH_THRESHOLD = 0.85
-LOOKBACK_HOURS = 4
-
-
-def find_match(cur: Any, results_table: str, job: dict[str, Any]) -> int | None:
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
-    cutoff_batch_id = f"batch_{cutoff.strftime('%Y%m%d_%H%M%S')}"
-
-    cur.execute(
-        psycopg2.sql.SQL(
-            """SELECT id, root_cause_summary FROM {}
-               WHERE root_cause_category = %s AND catalog_item = %s
-                 AND confidence = 'high' AND batch_id >= %s
-                 AND {active}"""
-        ).format(
-            psycopg2.sql.Identifier(results_table),
-            active=known_issue_active_sql(cur.connection, table=results_table),
-        ),
-        (job.get("root_cause_category"), job.get("catalog_item"), cutoff_batch_id),
-    )
-    summary = job.get("root_cause_summary", "")
-    for row in cur.fetchall():
-        if isinstance(row, Mapping):
-            row_id = row["id"]
-            existing_summary = row["root_cause_summary"]
-        else:
-            row_id, existing_summary = row
-        ratio = difflib.SequenceMatcher(None, summary, existing_summary).ratio()
-        if ratio >= MATCH_THRESHOLD:
-            print(f"[MATCH] job {job.get('job_id')} ({ratio:.0%}) -> result {row_id}")
-            print(f"  Current:    {summary[:120]}")
-            print(f"  Historical: {existing_summary[:120]}")
-            return row_id
-    return None
-
-
-def _validate_match_id(cur: Any, results_table: str, matched_id: int) -> bool:
-    """Confirm the agent's cited match exists and is a high-confidence result."""
-    cur.execute(
-        psycopg2.sql.SQL("SELECT 1 FROM {} WHERE id = %s AND confidence = 'high'").format(
-            psycopg2.sql.Identifier(results_table)
-        ),
-        (matched_id,),
-    )
-    return cur.fetchone() is not None
 
 
 def store_report(
@@ -85,70 +39,49 @@ def store_report(
         for job in jobs:
             jid = str(job.get("job_id", ""))
             status = job.get("status")
+            cur.execute(
+                psycopg2.sql.SQL(
+                    """INSERT INTO {}
+                       (batch_id, job_id, status, root_cause_category, root_cause_summary,
+                        confidence, catalog_item, job_duration_seconds)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (batch_id, job_id) DO UPDATE SET
+                           status = EXCLUDED.status,
+                           root_cause_category = EXCLUDED.root_cause_category,
+                           root_cause_summary = EXCLUDED.root_cause_summary,
+                           confidence = EXCLUDED.confidence,
+                           catalog_item = EXCLUDED.catalog_item,
+                           job_duration_seconds = EXCLUDED.job_duration_seconds
+                       RETURNING id"""
+                ).format(psycopg2.sql.Identifier(results_table)),
+                (
+                    batch_id,
+                    jid,
+                    status,
+                    job.get("root_cause_category"),
+                    job.get("root_cause_summary"),
+                    job.get("confidence"),
+                    job.get("catalog_item"),
+                    job.get("job_duration_seconds"),
+                ),
+            )
+            row = cur.fetchone()
+            new_id = (row["id"] if isinstance(row, Mapping) else row[0]) if row else None
+            if new_id is None:
+                print(f"[ERROR] Result insert for job {jid} did not return an ID", file=sys.stderr)
+                conn.rollback()
+                return False
 
-            matched_id = None
+            result_ids_by_job[jid] = new_id
+            job["result_id"] = new_id
             if status in ("analyzed", "matched_known_issue"):
-                candidate_id = job.get("matched_result_id")
-                if candidate_id is None:
-                    hist = job.get("historical_matches")
-                    if hist and isinstance(hist, list) and len(hist) > 0:
-                        candidate_id = hist[0].get("matched_result_id")
-
-                if candidate_id is not None:
-                    if _validate_match_id(cur, results_table, candidate_id):
-                        matched_id = candidate_id
-                        print(f"[MATCH-AGENT] job {jid} -> result {matched_id} (validated)")
-                    else:
-                        print(f"[WARN] job {jid}: declared match {candidate_id} failed validation")
-
-                if matched_id is None:
-                    matched_id = find_match(cur, results_table, job)
-
-            if matched_id is not None:
-                result_ids_by_job[jid] = matched_id
-                job["result_id"] = matched_id
                 cur.execute(
                     psycopg2.sql.SQL(
-                        """UPDATE {} SET aap2_job_results_fk_id = %s, ai_processed = TRUE
-                           WHERE job_id = %s"""
-                    ).format(psycopg2.sql.Identifier(source_table)),
-                    (matched_id, jid),
-                )
-            else:
-                cur.execute(
-                    psycopg2.sql.SQL(
-                        """INSERT INTO {}
-                           (batch_id, job_id, status, root_cause_category, root_cause_summary,
-                            confidence, catalog_item, job_duration_seconds)
-                           VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                           ON CONFLICT (batch_id, job_id) DO UPDATE SET status = EXCLUDED.status
-                           RETURNING id"""
-                    ).format(psycopg2.sql.Identifier(results_table)),
-                    (
-                        batch_id,
-                        jid,
-                        job.get("status"),
-                        job.get("root_cause_category"),
-                        job.get("root_cause_summary"),
-                        job.get("confidence"),
-                        job.get("catalog_item"),
-                        job.get("job_duration_seconds"),
-                    ),
-                )
-                row = cur.fetchone()
-                new_id = (row["id"] if isinstance(row, Mapping) else row[0]) if row else None
-                if new_id is not None:
-                    result_ids_by_job[jid] = new_id
-                    job["result_id"] = new_id
-
-                if status in ("analyzed", "matched_known_issue"):
-                    cur.execute(
-                        psycopg2.sql.SQL(
                         """UPDATE {} SET aap2_job_results_fk_id = %s, ai_processed = TRUE
                            WHERE job_id = %s"""
                     ).format(psycopg2.sql.Identifier(source_table)),
                     (new_id, jid),
-                    )
+                )
 
     for pattern in report.get("cross_job_patterns", []):
         if pattern.get("pattern_id"):
@@ -231,59 +164,194 @@ def link_intra_batch_dupes(
     return count
 
 
-def store_cross_patterns(conn: Any, config: dict[str, Any], report: dict[str, Any]) -> None:
-    patterns = report.get("cross_job_patterns", [])
-    if not patterns:
-        return
+def _job_summary_signals(job: dict[str, Any]) -> MatchSignals:
+    return MatchSignals(
+        catalog_item=job.get("catalog_item"),
+        text=job.get("root_cause_summary"),
+        category=job.get("root_cause_category"),
+    )
+
+
+def _fetch_result(
+    cur: Any, results_table: str, result_id: int
+) -> dict[str, Any] | None:
+    cur.execute(
+        psycopg2.sql.SQL(
+            """SELECT id, catalog_item, root_cause_category, root_cause_summary,
+                      cross_job_pattern
+               FROM {} WHERE id = %s
+               FOR UPDATE"""
+        ).format(psycopg2.sql.Identifier(results_table)),
+        (result_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    if isinstance(row, Mapping):
+        return dict(row)
+    return {
+        "id": row[0],
+        "catalog_item": row[1],
+        "root_cause_category": row[2],
+        "root_cause_summary": row[3],
+        "cross_job_pattern": row[4],
+    }
+
+
+def _canonical_anchor(row: dict[str, Any]) -> int:
+    candidate = row.get("cross_job_pattern")
+    try:
+        return int(candidate) if candidate is not None else int(row["id"])
+    except (TypeError, ValueError):
+        return int(row["id"])
+
+
+def _resolved_anchor(cur: Any, results_table: str, row: dict[str, Any]) -> int:
+    candidate = _canonical_anchor(row)
+    if candidate == int(row["id"]):
+        return candidate
+    anchor_row = _fetch_result(cur, results_table, candidate)
+    return candidate if anchor_row is not None else int(row["id"])
+
+
+def _assign_cluster(
+    cur: Any,
+    results_table: str,
+    result_ids: list[int],
+    target_anchor: int,
+    confidence: Confidence,
+    description: str | None,
+) -> int:
+    existing_rows = [_fetch_result(cur, results_table, result_id) for result_id in result_ids]
+    if any(row is None for row in existing_rows):
+        return target_anchor
+
+    existing_anchors = {
+        _resolved_anchor(cur, results_table, row)
+        for row in existing_rows
+        if row is not None
+    }
+    existing_anchors.add(target_anchor)
+    canonical_anchor = min(existing_anchors)
+
+    anchor_values = [str(anchor) for anchor in existing_anchors]
+    current_ids = [row["id"] for row in existing_rows if row is not None]
+    cur.execute(
+        psycopg2.sql.SQL(
+            """UPDATE {}
+               SET cross_job_pattern = %s,
+                   cross_job_pattern_description = CASE
+                       WHEN id = ANY(%s) THEN %s
+                       ELSE cross_job_pattern_description
+                   END,
+                   cross_job_pattern_confidence = CASE
+                       WHEN id = ANY(%s) THEN %s
+                       ELSE cross_job_pattern_confidence
+                   END
+               WHERE cross_job_pattern = ANY(%s) OR id = ANY(%s)"""
+        ).format(psycopg2.sql.Identifier(results_table)),
+        (
+            str(canonical_anchor),
+            current_ids,
+            description,
+            current_ids,
+            confidence,
+            anchor_values,
+            current_ids,
+        ),
+    )
+    return canonical_anchor
+
+
+def post_analysis_link(conn: Any, config: dict[str, Any], report: dict[str, Any]) -> None:
+    """Apply validated semantic and deterministic links as canonical clusters."""
+
     results_table = config["results_table"]
-    batch_id = report.get("batch_id", "")
     jobs = report.get("job_results") or report.get("job_summaries") or report.get("jobs", [])
+    jobs_by_id = {str(job.get("job_id")): job for job in jobs}
     result_ids_by_job = {
-        str(job.get("job_id")): job.get("result_id")
-        for job in jobs
+        job_id: job.get("result_id")
+        for job_id, job in jobs_by_id.items()
         if job.get("result_id") is not None
     }
+
     with conn.cursor() as cur:
-        for p in patterns:
-            pattern_id = p.get("pattern_id")
-            if not pattern_id:
+        for pattern in report.get("cross_job_patterns", []) or []:
+            pattern_jobs = [
+                jobs_by_id[str(job_id)]
+                for job_id in pattern.get("jobs", [])
+                if str(job_id) in jobs_by_id
+            ]
+            if len(pattern_jobs) < 2:
                 continue
-            pattern_name = str(pattern_id)
-            description = p.get("description")
-            for job_id in p.get("jobs", []):
-                result_id = result_ids_by_job.get(str(job_id))
-                if result_id is not None:
-                    cur.execute(
-                        psycopg2.sql.SQL(
-                            """UPDATE {}
-                               SET cross_job_pattern = %s, cross_job_pattern_description = %s
-                               WHERE id = %s"""
-                        ).format(psycopg2.sql.Identifier(results_table)),
-                        (pattern_name, description, result_id),
+            pairwise_confidences: list[Confidence | None] = []
+            for left_index, left_job in enumerate(pattern_jobs):
+                for right_job in pattern_jobs[left_index + 1 :]:
+                    score = score_similarity(
+                        _job_summary_signals(left_job),
+                        _job_summary_signals(right_job),
+                        "post_analysis",
+                        semantic_confidence=pattern.get("confidence"),
+                        semantic_reasoning=pattern.get("description"),
                     )
-                    continue
-                cur.execute(
-                    psycopg2.sql.SQL(
-                        """UPDATE {}
-                           SET cross_job_pattern = %s, cross_job_pattern_description = %s
-                           WHERE batch_id = %s AND job_id = %s"""
-                    ).format(psycopg2.sql.Identifier(results_table)),
-                    (pattern_name, description, batch_id, str(job_id)),
-                )
+                    pairwise_confidences.append(score.confidence)
+            confidence = weakest_confidence(pairwise_confidences)
+            if confidence is None:
+                continue
+
+            pattern_result_ids = [
+                int(result_ids_by_job[str(job["job_id"])])
+                for job in pattern_jobs
+                if str(job["job_id"]) in result_ids_by_job
+            ]
+            if len(pattern_result_ids) != len(pattern_jobs):
+                continue
+            anchor = min(pattern_result_ids)
+            canonical_anchor = _assign_cluster(
+                cur,
+                results_table,
+                pattern_result_ids,
+                anchor,
+                confidence,
+                pattern.get("description"),
+            )
+            pattern["pattern_id"] = str(canonical_anchor)
+
         for job in jobs:
             for match in job.get("historical_matches", []) or []:
-                pattern_id = match.get("pattern_id")
                 matched_result_id = match.get("matched_result_id")
-                if not pattern_id or matched_result_id is None:
+                if matched_result_id is None:
                     continue
-                cur.execute(
-                    psycopg2.sql.SQL(
-                        """UPDATE {}
-                           SET cross_job_pattern = %s
-                           WHERE id = %s AND cross_job_pattern IS NULL"""
-                    ).format(psycopg2.sql.Identifier(results_table)),
-                    (str(pattern_id), matched_result_id),
+                target_row = _fetch_result(cur, results_table, int(matched_result_id))
+                if target_row is None:
+                    continue
+                score = score_similarity(
+                    _job_summary_signals(job),
+                    MatchSignals(
+                        catalog_item=target_row.get("catalog_item"),
+                        text=target_row.get("root_cause_summary"),
+                        category=target_row.get("root_cause_category"),
+                    ),
+                    "post_analysis",
+                    semantic_confidence=match.get("confidence"),
+                    semantic_reasoning=match.get("similarity_reasoning"),
                 )
+                if score.confidence is None:
+                    continue
+                result_id = job.get("result_id")
+                if result_id is None:
+                    continue
+                target_anchor = _resolved_anchor(cur, results_table, target_row)
+                canonical_anchor = _assign_cluster(
+                    cur,
+                    results_table,
+                    [int(result_id)],
+                    target_anchor,
+                    score.confidence,
+                    match.get("similarity_reasoning"),
+                )
+                match["pattern_id"] = str(canonical_anchor)
+
     conn.commit()
 
 
@@ -375,9 +443,9 @@ def main(argv: list[str] | None = None) -> int:
             inserted += 1
             print(f"[OK] Stored {bid} ({len(jobs)} jobs)")
             try:
-                store_cross_patterns(conn, config, report)
+                post_analysis_link(conn, config, report)
             except Exception as e:
-                print(f"[WARN] Failed to store cross_job_patterns: {e}", file=sys.stderr)
+                print(f"[WARN] Failed to apply post-analysis links: {e}", file=sys.stderr)
 
     conn.close()
     print(f"[DONE] {inserted}/{len(files)} report(s) stored in {config['results_table']}")
