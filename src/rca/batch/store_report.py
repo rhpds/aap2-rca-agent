@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import psycopg2
+import psycopg2.extras
 import psycopg2.sql
 
 from rca.config import load_database_config
@@ -22,13 +23,88 @@ MATCH_THRESHOLD = 0.85
 LOOKBACK_HOURS = 4
 
 
+def _load_step5(analysis_path: str | None, jid: str) -> dict[str, Any] | None:
+    """Read step5_analysis_summary.json from the job's analysis directory, if available."""
+    if not analysis_path:
+        return None
+    path = os.path.join(analysis_path, "step5_analysis_summary.json")
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"[WARN] job {jid}: could not read step5 analysis ({path}): {e}", file=sys.stderr)
+        return None
+
+
+def _normalize_evidence(raw: list[Any] | None, jid: str) -> list[dict[str, Any]]:
+    evidence = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        evidence.append(
+            {
+                "source": item.get("source"),
+                "job_id": item.get("job_id") or jid,
+                "timestamp": item.get("timestamp"),
+                "message": item.get("message"),
+                "github_path": item.get("github_path"),
+            }
+        )
+    return evidence
+
+
+def _normalize_fix(fix: Any) -> dict[str, Any] | None:
+    if not isinstance(fix, dict) or not fix.get("status") or not fix.get("base_sha"):
+        return None
+    return {
+        "status": fix.get("status"),
+        "base_sha": fix.get("base_sha"),
+        "diff": fix.get("diff"),
+        "pr_link": fix.get("pr_link"),
+    }
+
+
+def _normalize_recommendations(raw: list[Any] | None) -> list[dict[str, Any]]:
+    recommendations = []
+    for rec in raw or []:
+        if not isinstance(rec, dict):
+            continue
+        recommendations.append(
+            {
+                "priority": rec.get("priority"),
+                "action": rec.get("action"),
+                "github_path": rec.get("github_path"),
+                "details": rec.get("details"),
+                "evidence_ref": rec.get("evidence_ref"),
+                "fix": _normalize_fix(rec.get("fix")),
+            }
+        )
+    return recommendations
+
+
+def build_root_cause(job: dict[str, Any], jid: str) -> dict[str, Any]:
+    """Assemble the root_cause JSONB payload from the job summary and its step5 analysis."""
+    step5 = _load_step5(job.get("analysis_path"), jid) or {}
+    return {
+        "summary": job.get("root_cause_summary", ""),
+        "platform": job.get("platform"),
+        "failing_role": job.get("failing_role"),
+        "failing_github_path": job.get("failing_github_path"),
+        "analysis_path": job.get("analysis_path"),
+        "evidence": _normalize_evidence(step5.get("evidence"), jid),
+        "causal_chain": step5.get("causal_chain") or [],
+        "misidentifications": step5.get("misidentifications") or [],
+        "recommendations": _normalize_recommendations(step5.get("recommendations")),
+    }
+
+
 def find_match(cur: Any, results_table: str, job: dict[str, Any]) -> int | None:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
     cutoff_batch_id = f"batch_{cutoff.strftime('%Y%m%d_%H%M%S')}"
 
     cur.execute(
         psycopg2.sql.SQL(
-            """SELECT id, root_cause_summary FROM {}
+            """SELECT id, root_cause->>'summary' AS root_cause_summary FROM {}
                WHERE root_cause_category = %s AND catalog_item = %s
                  AND confidence = 'high' AND batch_id >= %s
                  AND {active}"""
@@ -45,7 +121,7 @@ def find_match(cur: Any, results_table: str, job: dict[str, Any]) -> int | None:
             existing_summary = row["root_cause_summary"]
         else:
             row_id, existing_summary = row
-        ratio = difflib.SequenceMatcher(None, summary, existing_summary).ratio()
+        ratio = difflib.SequenceMatcher(None, summary, existing_summary or "").ratio()
         if ratio >= MATCH_THRESHOLD:
             print(f"[MATCH] job {job.get('job_id')} ({ratio:.0%}) -> result {row_id}")
             print(f"  Current:    {summary[:120]}")
@@ -118,7 +194,7 @@ def store_report(
                 cur.execute(
                     psycopg2.sql.SQL(
                         """INSERT INTO {}
-                           (batch_id, job_id, status, root_cause_category, root_cause_summary,
+                           (batch_id, job_id, status, root_cause_category, root_cause,
                             confidence, catalog_item, job_duration_seconds)
                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                            ON CONFLICT (batch_id, job_id) DO UPDATE SET status = EXCLUDED.status
@@ -129,7 +205,7 @@ def store_report(
                         jid,
                         job.get("status"),
                         job.get("root_cause_category"),
-                        job.get("root_cause_summary"),
+                        psycopg2.extras.Json(build_root_cause(job, jid)),
                         job.get("confidence"),
                         job.get("catalog_item"),
                         job.get("job_duration_seconds"),
