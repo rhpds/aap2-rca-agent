@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rca-ci-postgres
+  labels:
+    app: rca-ci-postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rca-ci-postgres
+  template:
+    metadata:
+      labels:
+        app: rca-ci-postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:16-alpine
+        env:
+        - name: POSTGRES_USER
+          value: rca_test
+        - name: POSTGRES_PASSWORD
+          value: rca_test
+        - name: POSTGRES_DB
+          value: rca_test
+        # OpenShift runs the pod as an arbitrary UID; the image can only
+        # chmod a data directory it creates itself, so PGDATA must be a
+        # subdirectory of the mounted volume.
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        ports:
+        - containerPort: 5432
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "rca_test", "-d", "rca_test"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 5
+          failureThreshold: 12
+        volumeMounts:
+        - name: pgdata
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: pgdata
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rca-ci-postgres
+  labels:
+    app: rca-ci-postgres
+spec:
+  selector:
+    app: rca-ci-postgres
+  ports:
+  - port: 5432
+    targetPort: 5432

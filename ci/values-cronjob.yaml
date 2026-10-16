@@ -1,0 +1,65 @@
+# Chart values for the CI CronJob test (tier 2). Secret values (litellm creds,
+# SSH key, settingsJson) are passed via --set by the workflow at install time.
+image:
+  registry: image-registry.openshift-image-registry.svc:5000
+  name: rhdp-rca-plugin
+  tag: latest
+
+cronjob:
+  schedule: "0 0 31 2 *"   # never fires on its own; CI runs a Job derived from the CronJob
+  limit: 10
+  maxParallelJobs: 5
+  since: "2 hours"
+  period: 30m
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+
+pvc:
+  storage: 1Gi
+  storageClassName: ""
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+claude:
+  backend: "litellm"
+  model: "claude-sonnet-4-6"
+
+ssh:
+  jumpboxAlias: ci-jumpbox
+
+secrets:
+  names:
+    litellmCreds: claude-litellm-creds
+    skillConfig: rca-skill-config
+    sshKey: ci-ssh-key
+    webhookSecret: rhdp-rca-plugin-webhook-secret
+  litellm:
+    baseUrl: ""            # set by the workflow from the in-cluster secret
+    apiKey: ""
+  skillConfig:
+    settingsJson: ""       # set by the workflow from ci/settings-cronjob.json
+  ssh:                     # all set by the workflow to point at the CI jumpbox
+    privateKey: ""
+    bastionHostname: ""
+    bastionUsername: ""
+    bastionPort: ""
+    dbBastionHostname: ""
+    dbBastionUsername: ""
+    dbBastionPort: ""
+    dbRemoteHost: ""
+    dbRemotePort: ""
+    jumpboxHostname: ""
+    jumpboxUsername: ""
+    jumpboxPort: ""
+
+buildconfig:
+  enabled: false
+
+evalPod:
+  enabled: false
