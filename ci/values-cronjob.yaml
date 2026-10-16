@@ -35,7 +35,10 @@ ssh:
 
 secrets:
   names:
-    litellmCreds: claude-litellm-creds
+    # Distinct from the tier-1 claude-litellm-creds secret: Helm creates and
+    # owns this one from the values the workflow passes at install time, and
+    # it cannot adopt the pre-existing tier-1 secret.
+    litellmCreds: rca-ci-cron-litellm-creds
     skillConfig: rca-skill-config
     sshKey: ci-ssh-key
     webhookSecret: rhdp-rca-plugin-webhook-secret
