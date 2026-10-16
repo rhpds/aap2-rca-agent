@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rca-ci-jumpbox
+  labels:
+    app: rca-ci-jumpbox
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rca-ci-jumpbox
+  template:
+    metadata:
+      labels:
+        app: rca-ci-jumpbox
+    spec:
+      containers:
+      - name: sshd
+        # Image is substituted by the workflow (built from ci/images/sshd,
+        # or the sshd_image input when provided).
+        image: IMAGE_PLACEHOLDER
+        ports:
+        - containerPort: 2222
+        readinessProbe:
+          exec:
+            command: ["/bin/bash", "-c", "timeout 2 bash -c '</dev/tcp/127.0.0.1/2222'"]
+          initialDelaySeconds: 3
+          periodSeconds: 5
+          timeoutSeconds: 5
+          failureThreshold: 12
+        volumeMounts:
+        - name: jumpbox-key
+          mountPath: /keys
+          readOnly: true
+      volumes:
+      - name: jumpbox-key
+        secret:
+          # Created by the workflow; holds id_ed25519 and id_ed25519.pub
+          secretName: rca-ci-jumpbox-key
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rca-ci-jumpbox
+  labels:
+    app: rca-ci-jumpbox
+spec:
+  selector:
+    app: rca-ci-jumpbox
+  ports:
+  - port: 2222
+    targetPort: 2222
