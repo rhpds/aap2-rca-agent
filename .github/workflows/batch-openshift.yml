@@ -120,6 +120,9 @@ jobs:
           EOF
           kubectl apply -n "$NS" -f ci/manifests/postgres.yaml
           sed "s|IMAGE_PLACEHOLDER|$SSHD_IMAGE|" ci/manifests/sshd.yaml | kubectl apply -n "$NS" -f -
+          # The keypair is regenerated every run; force the sshd to pick up
+          # the new authorized key rather than relying on secret-volume refresh.
+          kubectl rollout restart deployment/$JUMPBOX_NAME -n "$NS"
           kubectl rollout status deployment/$POSTGRES_NAME -n "$NS" --timeout=180s
           kubectl rollout status deployment/$JUMPBOX_NAME -n "$NS" --timeout=180s
 

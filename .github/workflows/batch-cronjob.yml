@@ -107,17 +107,27 @@ jobs:
         run: |
           kubectl apply -n "$NS" -f ci/manifests/postgres.yaml
           sed "s|IMAGE_PLACEHOLDER|$SSHD_IMAGE|" ci/manifests/sshd.yaml | kubectl apply -n "$NS" -f -
+          # The keypair is regenerated every run; force the sshd to pick up
+          # the new authorized key rather than relying on secret-volume refresh.
+          kubectl rollout restart deployment/$JUMPBOX_NAME -n "$NS"
           kubectl rollout status deployment/$POSTGRES_NAME -n "$NS" --timeout=180s
           kubectl rollout status deployment/$JUMPBOX_NAME -n "$NS" --timeout=180s
 
       - name: Install the chart with CI values
         run: |
-          # The chart composes the image as registry/<release-namespace>/name:tag;
-          # split the full image ref accordingly.
+          # The chart composes the image as registry/<release-namespace>/name:tag,
+          # so the input must be registry/<namespace>/name:tag and the namespace
+          # segment has to match the target namespace.
           REGISTRY_NAME="${IMAGE%:*}"
           TAG="${IMAGE##*:}"
-          REGISTRY="${REGISTRY_NAME%/*}"
           NAME="${REGISTRY_NAME##*/}"
+          REGISTRY_WITH_NS="${REGISTRY_NAME%/*}"
+          NS_SEG="${REGISTRY_WITH_NS##*/}"
+          REGISTRY="${REGISTRY_WITH_NS%/*}"
+          if [[ "$NS_SEG" != "$NS" ]]; then
+            echo "::error::image namespace segment '$NS_SEG' does not match target namespace '$NS'" >&2
+            exit 1
+          fi
           echo "registry=$REGISTRY name=$NAME tag=$TAG"
 
           # LiteLLM credentials are extracted from the in-cluster secret and
