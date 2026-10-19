@@ -12,16 +12,18 @@ name: Batch analysis via CronJob (OpenShift)
 # is KUBECONFIG_B64.
 
 on:
+  push:
+    branches: [ocp-testing, main]
   workflow_dispatch:
     inputs:
       namespace:
-        description: Namespace to run in (must hold the litellm secret)
-        required: true
-        default: rca-ci
+        description: Namespace to run in (must hold the litellm secret); empty = derive from KUBECONFIG_B64's current context
+        required: false
+        default: ""
       image:
-        description: rca image the CronJob runs
-        required: true
-        default: image-registry.openshift-image-registry.svc:5000/rhdp-rca-plugin:latest
+        description: rca image the CronJob runs; empty = build fresh from this commit
+        required: false
+        default: ""
       sshd_image:
         description: Prebuilt CI jumpbox image (empty = build from ci/images/sshd in-cluster)
         required: false
@@ -41,7 +43,7 @@ permissions:
 concurrency:
   # Same group as batch-openshift.yml: both manage rca-ci-postgres and
   # rca-ci-jumpbox in the namespace and must not overlap.
-  group: batch-openshift-${{ inputs.namespace }}
+  group: batch-openshift-shared
   cancel-in-progress: false
 
 env:
@@ -57,10 +59,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      NS: ${{ inputs.namespace }}
-      IMAGE: ${{ inputs.image }}
-      LITELLM_SECRET: ${{ inputs.litellm_secret }}
-      RELEASE: ${{ inputs.release }}
+      LITELLM_SECRET: ${{ inputs.litellm_secret || 'claude-litellm-creds' }}
+      RELEASE: ${{ inputs.release || 'rca-ci-cron' }}
       LOGS_DIR: /workspace/synthetic-logs
       STATE_DIR: /workspace/.rca
     steps:
@@ -71,7 +71,63 @@ jobs:
           mkdir -p "$HOME/.kube"
           printf '%s' "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
-          kubectl get namespace "$NS" > /dev/null
+
+      - name: Resolve namespace and image
+        run: |
+          NS="${{ inputs.namespace }}"
+          if [[ -z "$NS" ]]; then
+            NS=$(kubectl config view --minify -o jsonpath='{..namespace}')
+          fi
+          if [[ -z "$NS" ]]; then
+            echo "::error::no namespace in workflow_dispatch input or kubeconfig current context" >&2
+            exit 1
+          fi
+          echo "::add-mask::$NS"
+          echo "NS=$NS" >> "$GITHUB_ENV"
+
+          IMAGE="${{ inputs.image }}"
+          if [[ -z "$IMAGE" ]]; then
+            IMAGE="image-registry.openshift-image-registry.svc:5000/$NS/rhdp-rca-plugin:latest"
+          fi
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Verify namespace access
+        run: kubectl get namespace "$NS" > /dev/null
+
+      - name: Build the rca image for this commit
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz \
+            | tar -xz -C /tmp oc
+          mkdir -p "$HOME/bin"
+          mv /tmp/oc "$HOME/bin/oc"
+          export PATH="$HOME/bin:$PATH"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          export KUBECONFIG="$HOME/.kube/config"
+          kubectl apply -n "$NS" -f - <<'EOF'
+          apiVersion: image.openshift.io/v1
+          kind: ImageStream
+          metadata:
+            name: rhdp-rca-plugin
+          EOF
+          kubectl apply -n "$NS" -f - <<'EOF'
+          apiVersion: build.openshift.io/v1
+          kind: BuildConfig
+          metadata:
+            name: rhdp-rca-plugin
+          spec:
+            source:
+              type: Binary
+            strategy:
+              type: Docker
+              dockerStrategy:
+                dockerfilePath: deploy/Dockerfile
+            output:
+              to:
+                kind: ImageStreamTag
+                name: rhdp-rca-plugin:latest
+          EOF
+          oc start-build rhdp-rca-plugin -n "$NS" --from-dir=. --wait
 
       - name: Regenerate the synthetic job logs
         run: python3 ci/synthetic-logs/generate.py
@@ -86,11 +142,14 @@ jobs:
             --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Build the CI jumpbox image (unless prebuilt)
-        if: ${{ inputs.sshd_image == '' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.sshd_image == '' }}
         run: |
-          curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/oc.tar.gz \
+          curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz \
             | tar -xz -C /tmp oc
-          sudo mv /tmp/oc /usr/local/bin/oc
+          mkdir -p "$HOME/bin"
+          mv /tmp/oc "$HOME/bin/oc"
+          export PATH="$HOME/bin:$PATH"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
           export KUBECONFIG="$HOME/.kube/config"
           oc new-build --binary --strategy docker --name "$JUMPBOX_NAME" -n "$NS" 2>/dev/null || true
           oc start-build "$JUMPBOX_NAME" -n "$NS" --from-dir=ci/images/sshd --wait
