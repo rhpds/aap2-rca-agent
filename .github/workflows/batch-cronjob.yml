@@ -11,9 +11,17 @@ name: Batch analysis via CronJob (OpenShift)
 # the two never overlap); reuses its ci/ assets. The only GitHub-side secret
 # is KUBECONFIG_B64.
 
+# SECURITY MODEL: on pull_request_target events, the workflow definition runs
+# from the PR's base branch but the PR's code is checked out and executed
+# (Dockerfile RUN steps, ci/* scripts) WITH cluster credentials available.
+# The safe-to-test label is the human trust gate — only add it after reviewing
+# the diff, especially deploy/Dockerfile, ci/*, and workflow-affecting files.
+
 on:
   push:
-    branches: [ocp-testing, main]
+    branches: [ocp-testing]        # dev-branch iteration; drop once the label gate is live on main
+  pull_request_target:
+    types: [labeled]
   workflow_dispatch:
     inputs:
       namespace:
@@ -56,6 +64,9 @@ env:
 jobs:
   cronjob:
     name: Install the chart and run one batch from the CronJob
+    # Label gate: pull_request_target runs (which get fork PRs and full
+    # secrets) only execute when the safe-to-test label was just added.
+    if: ${{ github.event_name != 'pull_request_target' || github.event.label.name == 'safe-to-test' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -64,7 +75,12 @@ jobs:
       LOGS_DIR: /workspace/synthetic-logs
       STATE_DIR: /workspace/.rca
     steps:
+      # In pull_request_target context the default checkout would use the PR's
+      # base branch; explicitly check out the PR head so the PR's code is what
+      # gets tested. Falls back to the event's own SHA on push/dispatch.
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Configure cluster access
         run: |
@@ -95,7 +111,7 @@ jobs:
         run: kubectl get namespace "$NS" > /dev/null
 
       - name: Build the rca image for this commit
-        if: ${{ github.event_name == 'push' }}
+        if: ${{ github.event_name != 'workflow_dispatch' }}
         run: |
           curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz \
             | tar -xz -C /tmp oc
