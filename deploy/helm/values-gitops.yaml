@@ -1,0 +1,78 @@
+# Values for the ArgoCD-managed deployment (deploy/argocd/application.yaml).
+# Mirrors the live rhdp-rca release so an ArgoCD sync only applies intended
+# changes. Secret data is intentionally empty: the real secrets already exist
+# in the rh-ace-aiops namespace and are protected by the Application's
+# ignoreDifferences on /data and /stringData.
+buildconfig:
+  enabled: true
+
+git:
+  uri: https://github.com/rhpds/aap2-rca-agent.git
+  ref: main
+
+image:
+  registry: image-registry.openshift-image-registry.svc:5000
+  name: rhdp-rca-plugin
+  tag: latest
+  digest: sha256:257c3d662f8ebeb50c850ce8fc2c55a528fbc70b25c7cc7d1a778a5107d769a7
+
+cronjob:
+  schedule: "7,27,47 * * * *"
+  limit: 15
+  maxParallelJobs: 5
+  since: "20 minutes"
+  period: 20m
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  suspend: true
+
+pvc:
+  storage: 5Gi
+  storageClassName: ocs-storagecluster-ceph-rbd
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+
+claude:
+  backend: "litellm"
+  model: "claude-sonnet-4-6"
+
+ssh:
+  jumpboxAlias: ci-jumpbox
+
+secrets:
+  names:
+    vertexCreds: claude-vertex-creds
+    litellmCreds: claude-litellm-creds
+    skillConfig: rca-skill-config
+    sshKey: ci-ssh-key
+    webhookSecret: rhdp-rca-plugin-webhook-secret
+  # All secret data fields are intentionally empty. The real secrets already
+  # exist in the cluster; ignoreDifferences in the Application prevents a
+  # sync from overwriting their contents.
+  litellm:
+    baseUrl: ""
+    apiKey: ""
+  skillConfig:
+    settingsJson: ""
+  ssh:
+    privateKey: ""
+    bastionHostname: ""
+    bastionUsername: ""
+    bastionPort: ""
+    dbBastionHostname: ""
+    dbBastionUsername: ""
+    dbBastionPort: ""
+    dbRemoteHost: ""
+    dbRemotePort: ""
+    jumpboxHostname: ""
+    jumpboxUsername: ""
+    jumpboxPort: ""
+
+evalPod:
+  enabled: false
