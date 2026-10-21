@@ -7,9 +7,7 @@ name: Batch analysis via CronJob (OpenShift)
 # CI Postgres, so the CronJob's own tunnel forwards through our sshd to our
 # database. Nothing real is touched.
 #
-# Shares the CI namespace with batch-openshift.yml (same concurrency group so
-# the two never overlap); reuses its ci/ assets. The only GitHub-side secret
-# is KUBECONFIG_B64.
+# The only GitHub-side secret is KUBECONFIG_B64.
 
 # SECURITY MODEL: on pull_request_target events, the workflow definition runs
 # from the PR's base branch but the PR's code is checked out and executed
@@ -49,9 +47,7 @@ permissions:
   contents: read
 
 concurrency:
-  # Same group as batch-openshift.yml: both manage rca-ci-postgres and
-  # rca-ci-jumpbox in the namespace and must not overlap.
-  group: batch-openshift-shared
+  group: batch-cronjob
   cancel-in-progress: false
 
 env:
