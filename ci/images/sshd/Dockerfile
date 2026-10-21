@@ -1,5 +1,5 @@
 # CI jumpbox stand-in: an sshd+rsync server that runs as an arbitrary UID
-# under OpenShift's restricted SCC. Built by the batch-openshift workflow via
+# under OpenShift's restricted SCC. Built by the batch-cronjob workflow via
 # a binary build; no real jumpbox or bastion is involved.
 FROM debian:bookworm-slim
 
