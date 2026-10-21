@@ -9,15 +9,17 @@ timeout_secs="${WAIT_TIMEOUT_SECS:-1200}"
 deadline=$(( SECONDS + timeout_secs ))
 
 while :; do
-  failed=$(kubectl get job -n "$NS" "$JOB_NAME" -o jsonpath='{.status.failed}' 2>/dev/null || true)
-  succeeded=$(kubectl get job -n "$NS" "$JOB_NAME" -o jsonpath='{.status.succeeded}' 2>/dev/null || true)
+  # Use the Job's terminal conditions rather than pod counts: the Job retries
+  # failed pods up to backoffLimit, so one failed pod is not a failed Job.
+  failed=$(kubectl get job -n "$NS" "$JOB_NAME" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)
+  complete=$(kubectl get job -n "$NS" "$JOB_NAME" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)
 
-  if [[ "$failed" =~ ^[1-9] ]]; then
+  if [[ "$failed" == "True" ]]; then
     echo "::error::batch job failed"
     kubectl logs -n "$NS" "job/$JOB_NAME" --all-containers || true
     exit 1
   fi
-  if [[ "$succeeded" == "1" ]]; then
+  if [[ "$complete" == "True" ]]; then
     echo "batch job completed"
     exit 0
   fi

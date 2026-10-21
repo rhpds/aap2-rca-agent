@@ -29,7 +29,7 @@ def _settings() -> dict[str, str]:
         from rca.config import load_environment
 
         return load_environment()
-    except Exception:
+    except ImportError:
         import os
 
         return dict(os.environ)
