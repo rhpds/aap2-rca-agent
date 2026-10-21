@@ -107,7 +107,7 @@ jobs:
         run: kubectl get namespace "$NS" > /dev/null
 
       - name: Build the rca image for this commit
-        if: ${{ github.event_name != 'workflow_dispatch' }}
+        if: ${{ inputs.image == '' }}
         run: |
           curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz \
             | tar -xz -C /tmp oc
@@ -154,7 +154,7 @@ jobs:
             --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Build the CI jumpbox image (unless prebuilt)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.sshd_image == '' }}
+        if: ${{ inputs.sshd_image == '' }}
         run: |
           curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz \
             | tar -xz -C /tmp oc
@@ -286,17 +286,20 @@ jobs:
           mkdir -p out
           kubectl exec -n "$NS" "$WORKSPACE_POD" -- cat "$REPORT" > out/batch_report.json
           kubectl logs -n "$NS" "job/$JOB_NAME" --all-containers > out/batch.log || true
-          python ci/verify_report.py out/batch_report.json
+          python3 ci/verify_report.py out/batch_report.json
 
       - name: Verify uploads landed on the CI jumpbox
         run: |
           UPLOADED=$(kubectl exec -n "$NS" "deployment/$JUMPBOX_NAME" -- ls -1 /usr/local/mlflow | sort | tr '\n' ' ')
           echo "uploaded: $UPLOADED"
-          for jid in $(python3 -c "
+          # Capture first so set -e catches a python failure; inside
+          # `for ... in $(...)` it would silently yield an empty loop.
+          ANALYZED=$(python3 -c "
           import json
           report = json.load(open('out/batch_report.json'))
           print(' '.join(s['job_id'] for s in report['job_summaries'] if s['status'] == 'analyzed'))
-          "); do
+          ")
+          for jid in $ANALYZED; do
             if ! grep -qw "$jid" <<< "$UPLOADED"; then
               echo "::error::analyzed job $jid has no upload directory on the CI jumpbox"
               exit 1
