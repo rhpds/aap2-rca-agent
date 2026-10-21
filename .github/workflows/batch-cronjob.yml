@@ -316,7 +316,8 @@ jobs:
           if-no-files-found: ignore
 
       - name: Cleanup
-        if: always()
+        # Toggle without commits: gh variable set CI_SKIP_CLEANUP --body "true"
+        if: ${{ always() && vars.CI_SKIP_CLEANUP != 'true' }}
         run: |
           helm uninstall "$RELEASE" -n "$NS" 2>/dev/null || true
           kubectl delete job "$JOB_NAME" -n "$NS" --ignore-not-found
@@ -324,3 +325,8 @@ jobs:
           kubectl delete deployment "$POSTGRES_NAME" service "$POSTGRES_NAME" -n "$NS" --ignore-not-found
           kubectl delete deployment "$JUMPBOX_NAME" service "$JUMPBOX_NAME" -n "$NS" --ignore-not-found
           kubectl delete secret "$JUMPBOX_KEY_SECRET" -n "$NS" --ignore-not-found
+
+      - name: Notice cleanup skipped
+        if: ${{ always() && vars.CI_SKIP_CLEANUP == 'true' }}
+        run: |
+          echo "::notice::Cleanup skipped (CI_SKIP_CLEANUP=true) — resources left in the namespace for inspection."
