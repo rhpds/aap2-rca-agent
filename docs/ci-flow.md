@@ -55,27 +55,30 @@ flowchart TD
     G -- no --> C["concurrency group: batch-cronjob<br/>(queued, never cancelled)"]
 
     C --> CO["checkout<br/>PR head SHA, or github.sha"]
-    CO --> KC["Write kubeconfig<br/>from secrets.KUBECONFIG_B64"]
-    KC --> NSK["namespace from kubeconfig context"]
-    NSK --> NSE{"namespace empty?"}
+    CO --> SETUP
+
+    subgraph SETUP["Set up cluster access and tools (one step)"]
+        KC["Write kubeconfig<br/>from secrets.KUBECONFIG_B64"] --> NSK["namespace from kubeconfig context"]
+        NSK --> NSE{"namespace empty?"}
+        NSE -- no --> VA["kubectl get namespace<br/>(verify access)"]
+        VA --> IMGD["export NS, IMAGE, SSHD_IMAGE<br/>(internal registry, $NS/…:latest)"]
+        IMGD --> OC["install oc → $HOME/bin<br/>(added to GITHUB_PATH)"]
+    end
     NSE -- yes --> FAIL1([fail])
-    NSE -- no --> IMGD["IMAGE = internal registry<br/>$NS/rhdp-rca-plugin:latest"]
-    IMGD --> VA["kubectl get namespace<br/>(verify access)"]
-    VA --> BUILD
+    OC --> BUILD
 ```
 
 ### Building images and synthetic infrastructure
 
 ```mermaid
 flowchart TD
-    B1["install oc<br/>apply ImageStream + BuildConfig<br/>oc start-build --from-dir=. --wait"]
+    BUILD["apply ImageStream + BuildConfig<br/>oc start-build --from-dir=. --wait"]
 
-    B1 --> GEN["python3 ci/synthetic-logs/generate.py<br/>(regenerate job logs)"] --> KEY["ssh-keygen ed25519<br/>→ secret rca-ci-jumpbox-key"]
+    BUILD --> GEN["python3 ci/synthetic-logs/generate.py<br/>(regenerate job logs)"] --> KEY["ssh-keygen ed25519<br/>→ secret rca-ci-jumpbox-key"]
 
     KEY --> SB1["oc new-build rca-ci-jumpbox<br/>oc start-build --from-dir=ci/images/sshd"]
-    SB1 --> RES2["SSHD_IMAGE = internal registry<br/>$NS/rca-ci-jumpbox:latest"]
 
-    RES2 --> INFRA["apply ci/manifests/postgres.yaml<br/>apply ci/manifests/sshd.yaml (SSHD_IMAGE)<br/>rollout restart jumpbox (pick up new key)<br/>wait for both rollouts"]
+    SB1 --> INFRA["apply ci/manifests/postgres.yaml<br/>apply ci/manifests/sshd.yaml (SSHD_IMAGE)<br/>rollout restart jumpbox (pick up new key)<br/>wait for both rollouts"]
     INFRA --> HELM
 ```
 

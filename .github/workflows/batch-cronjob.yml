@@ -57,35 +57,33 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      - name: Configure cluster access
+      # Cluster access, namespace, images and oc. NS/IMAGE/SSHD_IMAGE (GITHUB_ENV) and oc
+      # (GITHUB_PATH) become available to every later step.
+      - name: Set up cluster access and tools
         run: |
           mkdir -p "$HOME/.kube"
           printf '%s' "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
 
-      - name: Resolve namespace and image
-        run: |
           NS=$(kubectl config view --minify -o jsonpath='{..namespace}')
           if [[ -z "$NS" ]]; then
             echo "::error::no namespace in the kubeconfig current context" >&2
             exit 1
           fi
           echo "::add-mask::$NS"
+          kubectl get namespace "$NS" > /dev/null
           echo "NS=$NS" >> "$GITHUB_ENV"
           echo "IMAGE=image-registry.openshift-image-registry.svc:5000/$NS/rhdp-rca-plugin:latest" >> "$GITHUB_ENV"
+          echo "SSHD_IMAGE=image-registry.openshift-image-registry.svc:5000/$NS/$JUMPBOX_NAME:latest" >> "$GITHUB_ENV"
 
-      - name: Verify namespace access
-        run: kubectl get namespace "$NS" > /dev/null
+          # oc is needed for binary builds (oc start-build --from-dir).
+          mkdir -p "$HOME/bin"
+          curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz \
+            | tar -xz -C "$HOME/bin" oc
+          echo "$HOME/bin" >> "$GITHUB_PATH"
 
       - name: Build the rca image for this commit
         run: |
-          curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz \
-            | tar -xz -C /tmp oc
-          mkdir -p "$HOME/bin"
-          mv /tmp/oc "$HOME/bin/oc"
-          export PATH="$HOME/bin:$PATH"
-          echo "$HOME/bin" >> "$GITHUB_PATH"
-          export KUBECONFIG="$HOME/.kube/config"
           kubectl apply -n "$NS" -f - <<'EOF'
           apiVersion: image.openshift.io/v1
           kind: ImageStream
@@ -125,18 +123,8 @@ jobs:
 
       - name: Build the CI jumpbox image
         run: |
-          curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz \
-            | tar -xz -C /tmp oc
-          mkdir -p "$HOME/bin"
-          mv /tmp/oc "$HOME/bin/oc"
-          export PATH="$HOME/bin:$PATH"
-          echo "$HOME/bin" >> "$GITHUB_PATH"
-          export KUBECONFIG="$HOME/.kube/config"
           oc new-build --binary --strategy docker --name "$JUMPBOX_NAME" -n "$NS" 2>/dev/null || true
           oc start-build "$JUMPBOX_NAME" -n "$NS" --from-dir=ci/images/sshd --wait
-
-      - name: Resolve CI jumpbox image
-        run: echo "SSHD_IMAGE=image-registry.openshift-image-registry.svc:5000/$NS/$JUMPBOX_NAME:latest" >> "$GITHUB_ENV"
 
       - name: Create CI Postgres and CI jumpbox
         run: |
