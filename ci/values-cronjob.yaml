@@ -1,5 +1,7 @@
 # Chart values for the CI CronJob test (tier 2). Secret values (litellm creds,
 # SSH key, settingsJson) are passed via --set by the workflow at install time.
+# Everything else is fixed: the CI jumpbox and Postgres live in the same
+# namespace as the release, so short service names resolve.
 image:
   registry: image-registry.openshift-image-registry.svc:5000
   name: rhdp-rca-plugin
@@ -47,19 +49,19 @@ secrets:
     apiKey: ""
   skillConfig:
     settingsJson: ""       # set by the workflow from ci/settings-cronjob.json
-  ssh:                     # all set by the workflow to point at the CI jumpbox
-    privateKey: ""
-    bastionHostname: ""
-    bastionUsername: ""
-    bastionPort: ""
-    dbBastionHostname: ""
-    dbBastionUsername: ""
-    dbBastionPort: ""
-    dbRemoteHost: ""
-    dbRemotePort: ""
-    jumpboxHostname: ""
-    jumpboxUsername: ""
-    jumpboxPort: ""
+  ssh:                     # every endpoint is the CI jumpbox; it forwards to the CI Postgres
+    privateKey: ""         # set by the workflow (regenerated every run)
+    bastionHostname: rca-ci-jumpbox
+    bastionUsername: testuser
+    bastionPort: "2222"
+    dbBastionHostname: rca-ci-jumpbox
+    dbBastionUsername: testuser
+    dbBastionPort: "2222"
+    dbRemoteHost: rca-ci-postgres
+    dbRemotePort: "5432"
+    jumpboxHostname: rca-ci-jumpbox
+    jumpboxUsername: testuser
+    jumpboxPort: "2222"
 
 buildconfig:
   enabled: false

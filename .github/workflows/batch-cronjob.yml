@@ -21,27 +21,6 @@ on:
   pull_request_target:
     types: [labeled]
   workflow_dispatch:
-    inputs:
-      namespace:
-        description: Namespace to run in (must hold the litellm secret); empty = derive from KUBECONFIG_B64's current context
-        required: false
-        default: ""
-      image:
-        description: rca image the CronJob runs; empty = build fresh from this commit
-        required: false
-        default: ""
-      sshd_image:
-        description: Prebuilt CI jumpbox image (empty = build from ci/images/sshd in-cluster)
-        required: false
-        default: ""
-      litellm_secret:
-        description: Secret with ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY
-        required: true
-        default: claude-litellm-creds
-      release:
-        description: Helm release name (CronJob will be <release>-batch)
-        required: true
-        default: rca-ci-cron
 
 permissions:
   contents: read
@@ -66,8 +45,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      LITELLM_SECRET: ${{ inputs.litellm_secret || 'claude-litellm-creds' }}
-      RELEASE: ${{ inputs.release || 'rca-ci-cron' }}
+      LITELLM_SECRET: claude-litellm-creds
+      RELEASE: rca-ci-cron
       LOGS_DIR: /workspace/synthetic-logs
       STATE_DIR: /workspace/.rca
     steps:
@@ -86,28 +65,19 @@ jobs:
 
       - name: Resolve namespace and image
         run: |
-          NS="${{ inputs.namespace }}"
+          NS=$(kubectl config view --minify -o jsonpath='{..namespace}')
           if [[ -z "$NS" ]]; then
-            NS=$(kubectl config view --minify -o jsonpath='{..namespace}')
-          fi
-          if [[ -z "$NS" ]]; then
-            echo "::error::no namespace in workflow_dispatch input or kubeconfig current context" >&2
+            echo "::error::no namespace in the kubeconfig current context" >&2
             exit 1
           fi
           echo "::add-mask::$NS"
           echo "NS=$NS" >> "$GITHUB_ENV"
-
-          IMAGE="${{ inputs.image }}"
-          if [[ -z "$IMAGE" ]]; then
-            IMAGE="image-registry.openshift-image-registry.svc:5000/$NS/rhdp-rca-plugin:latest"
-          fi
-          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          echo "IMAGE=image-registry.openshift-image-registry.svc:5000/$NS/rhdp-rca-plugin:latest" >> "$GITHUB_ENV"
 
       - name: Verify namespace access
         run: kubectl get namespace "$NS" > /dev/null
 
       - name: Build the rca image for this commit
-        if: ${{ inputs.image == '' }}
         run: |
           curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz \
             | tar -xz -C /tmp oc
@@ -153,8 +123,7 @@ jobs:
             --from-file=id_ed25519.pub=/tmp/ci_jumpbox_key.pub \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Build the CI jumpbox image (unless prebuilt)
-        if: ${{ inputs.sshd_image == '' }}
+      - name: Build the CI jumpbox image
         run: |
           curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz \
             | tar -xz -C /tmp oc
@@ -167,12 +136,7 @@ jobs:
           oc start-build "$JUMPBOX_NAME" -n "$NS" --from-dir=ci/images/sshd --wait
 
       - name: Resolve CI jumpbox image
-        run: |
-          if [[ -n "${{ inputs.sshd_image }}" ]]; then
-            echo "SSHD_IMAGE=${{ inputs.sshd_image }}" >> "$GITHUB_ENV"
-          else
-            echo "SSHD_IMAGE=image-registry.openshift-image-registry.svc:5000/$NS/$JUMPBOX_NAME:latest" >> "$GITHUB_ENV"
-          fi
+        run: echo "SSHD_IMAGE=image-registry.openshift-image-registry.svc:5000/$NS/$JUMPBOX_NAME:latest" >> "$GITHUB_ENV"
 
       - name: Create CI Postgres and CI jumpbox
         run: |
@@ -186,21 +150,8 @@ jobs:
 
       - name: Install the chart with CI values
         run: |
-          # The chart composes the image as registry/<release-namespace>/name:tag,
-          # so the input must be registry/<namespace>/name:tag and the namespace
-          # segment has to match the target namespace.
-          REGISTRY_NAME="${IMAGE%:*}"
-          TAG="${IMAGE##*:}"
-          NAME="${REGISTRY_NAME##*/}"
-          REGISTRY_WITH_NS="${REGISTRY_NAME%/*}"
-          NS_SEG="${REGISTRY_WITH_NS##*/}"
-          REGISTRY="${REGISTRY_WITH_NS%/*}"
-          if [[ "$NS_SEG" != "$NS" ]]; then
-            echo "::error::image namespace segment '$NS_SEG' does not match target namespace '$NS'" >&2
-            exit 1
-          fi
-          echo "registry=$REGISTRY name=$NAME tag=$TAG"
-
+          # Image and SSH endpoints come from ci/values-cronjob.yaml; only
+          # secrets are passed here.
           # LiteLLM credentials are extracted from the in-cluster secret and
           # re-fed to Helm, which creates the chart's own secret from them.
           LITELLM_URL=$(kubectl get secret "$LITELLM_SECRET" -n "$NS" -o jsonpath='{.data.ANTHROPIC_BASE_URL}' | base64 -d)
@@ -210,29 +161,12 @@ jobs:
             exit 1
           fi
 
-          JUMPBOX_HOST="$JUMPBOX_NAME.$NS.svc"
-          POSTGRES_HOST="$POSTGRES_NAME.$NS.svc.cluster.local"
-
           helm upgrade --install "$RELEASE" deploy/helm -n "$NS" \
             -f ci/values-cronjob.yaml \
-            --set image.registry="$REGISTRY" \
-            --set image.name="$NAME" \
-            --set image.tag="$TAG" \
             --set-string secrets.litellm.baseUrl="$LITELLM_URL" \
             --set-string secrets.litellm.apiKey="$LITELLM_KEY" \
             --set-file secrets.skillConfig.settingsJson=ci/settings-cronjob.json \
-            --set-file secrets.ssh.privateKey=/tmp/ci_jumpbox_key \
-            --set secrets.ssh.bastionHostname="$JUMPBOX_HOST" \
-            --set secrets.ssh.bastionUsername=testuser \
-            --set secrets.ssh.bastionPort="2222" \
-            --set secrets.ssh.dbBastionHostname="$JUMPBOX_HOST" \
-            --set secrets.ssh.dbBastionUsername=testuser \
-            --set secrets.ssh.dbBastionPort="2222" \
-            --set secrets.ssh.dbRemoteHost="$POSTGRES_HOST" \
-            --set secrets.ssh.dbRemotePort="5432" \
-            --set secrets.ssh.jumpboxHostname="$JUMPBOX_HOST" \
-            --set secrets.ssh.jumpboxUsername=testuser \
-            --set secrets.ssh.jumpboxPort="2222"
+            --set-file secrets.ssh.privateKey=/tmp/ci_jumpbox_key
 
       - name: Start workspace helper pod on the chart PVC
         run: |
@@ -262,13 +196,9 @@ jobs:
       - name: Stage synthetic logs and seed the database
         run: |
           kubectl exec -n "$NS" "$WORKSPACE_POD" -- mkdir -p "$LOGS_DIR" /tmp/ci
-          for f in ci/synthetic-logs/*; do
-            kubectl exec -i -n "$NS" "$WORKSPACE_POD" -- bash -c "cat > $LOGS_DIR/$(basename "$f")" < "$f"
-          done
+          tar -C ci/synthetic-logs -cf - . | kubectl exec -i -n "$NS" "$WORKSPACE_POD" -- tar -xf - -C "$LOGS_DIR"
           kubectl exec -i -n "$NS" "$WORKSPACE_POD" -- bash -c "cat > /tmp/ci/seed_test_db.py" < ci/seed_test_db.py
-          POSTGRES_SERVICE="$POSTGRES_NAME.$NS.svc.cluster.local"
-          sed "s/__POSTGRES_SERVICE__/$POSTGRES_SERVICE/" ci/settings-localdb.json \
-            | kubectl exec -i -n "$NS" "$WORKSPACE_POD" -- bash -c "cat > /tmp/ci/settings.json"
+          kubectl exec -i -n "$NS" "$WORKSPACE_POD" -- bash -c "cat > /tmp/ci/settings.json" < ci/settings-localdb.json
           kubectl exec -n "$NS" "$WORKSPACE_POD" -- \
             env RCA_SETTINGS_FILE=/tmp/ci/settings.json JOB_LOGS_DIR="$LOGS_DIR" \
             python /tmp/ci/seed_test_db.py
