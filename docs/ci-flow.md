@@ -5,6 +5,8 @@ Two workflows run in CI:
 - **`tests.yml`**: unit and integration tests. Runs on every push and every PR.
 - **`batch-cronjob.yml`**: installs the real Helm chart on OpenShift and runs one batch from the actual CronJob. Everything it talks to is synthetic: a CI Postgres, a CI SSH jumpbox and generated job logs.
 
+All CI names, ports, DB settings and the model live in `ci/ci.env`. The workflow loads it into the job environment and renders the manifests, Helm flags and settings JSON from it; `ci/setup-namespace.sh` sources it too.
+
 ## Overview
 
 ```mermaid
@@ -74,7 +76,7 @@ flowchart TD
 flowchart TD
     BUILD["apply ImageStream + BuildConfig<br/>oc start-build --from-dir=. --wait"]
 
-    BUILD --> GEN["python3 ci/synthetic-logs/generate.py<br/>(regenerate job logs)"] --> KEY["ssh-keygen ed25519<br/>→ secret rca-ci-jumpbox-key"]
+    BUILD --> KEY["ssh-keygen ed25519<br/>→ secret rca-ci-jumpbox-key"]
 
     KEY --> SB1["oc new-build rca-ci-jumpbox<br/>oc start-build --from-dir=ci/images/sshd"]
 
@@ -88,11 +90,11 @@ flowchart TD
 flowchart TD
     HELM["Read ANTHROPIC_BASE_URL / API_KEY<br/>from litellm secret"] --> LLC{"both present?"}
     LLC -- no --> FAIL3([fail])
-    LLC -- yes --> HI["helm upgrade --install<br/>-f ci/values-cronjob.yaml (image, SSH endpoints:<br/>bastion / db-bastion / jumpbox → rca-ci-jumpbox:2222,<br/>db remote → rca-ci-postgres:5432)<br/>--set: litellm creds, ci/settings-cronjob.json,<br/>ssh key /tmp/ci_jumpbox_key"]
+    LLC -- yes --> HI["jq: settings JSON from ci/ci.env<br/>(SOURCE_DB_* → localhost:15432 tunnel)<br/>helm upgrade --install -f ci/values-cronjob.yaml<br/>--set from ci/ci.env: model, parallelism, SSH endpoints<br/>(bastion / db-bastion / jumpbox → rca-ci-jumpbox:2222,<br/>db remote → rca-ci-postgres:5432)<br/>--set: litellm creds, settings JSON, ssh key"]
 
     HI --> WP["Start rca-ci-workspace pod<br/>(IMAGE, mounts $RELEASE-pvc at /workspace)<br/>wait Ready"]
-    WP --> ST["tar-copy ci/synthetic-logs → /workspace/synthetic-logs<br/>copy seed_test_db.py + settings-localdb.json"]
-    ST --> SEED["seed_test_db.py in workspace pod<br/>create tables, insert one event per synthetic job"]
+    WP --> ST["copy seed_test_db.py into workspace pod<br/>SOURCE_DB_* from ci/ci.env passed inline<br/>(direct to rca-ci-postgres:5432)"]
+    ST --> SEED["seed_test_db.py in workspace pod:<br/>write job_*.json.gz into JOB_LOGS_DIR,<br/>create tables, insert one event per job"]
 
     SEED --> RUN["kubectl create job rca-ci-cronjob-run<br/>--from=cronjob/$RELEASE-batch"]
     RUN --> WAIT

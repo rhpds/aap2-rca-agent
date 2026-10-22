@@ -1,29 +1,33 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: rca-ci-jumpbox
+  name: ${JUMPBOX_NAME}
   labels:
-    app: rca-ci-jumpbox
+    app: ${JUMPBOX_NAME}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: rca-ci-jumpbox
+      app: ${JUMPBOX_NAME}
   template:
     metadata:
       labels:
-        app: rca-ci-jumpbox
+        app: ${JUMPBOX_NAME}
     spec:
       containers:
       - name: sshd
-        # Image is substituted by the workflow (built from ci/images/sshd,
-        # or the sshd_image input when provided).
-        image: IMAGE_PLACEHOLDER
+        # Built from ci/images/sshd; substituted by the workflow.
+        image: ${SSHD_IMAGE}
+        env:
+        - name: SSHD_PORT
+          value: "${JUMPBOX_PORT}"
+        - name: SSHD_USER
+          value: ${JUMPBOX_USER}
         ports:
-        - containerPort: 2222
+        - containerPort: ${JUMPBOX_PORT}
         readinessProbe:
           exec:
-            command: ["/bin/bash", "-c", "timeout 2 bash -c '</dev/tcp/127.0.0.1/2222'"]
+            command: ["/bin/bash", "-c", "timeout 2 bash -c '</dev/tcp/127.0.0.1/${JUMPBOX_PORT}'"]
           initialDelaySeconds: 3
           periodSeconds: 5
           timeoutSeconds: 5
@@ -36,17 +40,17 @@ spec:
       - name: jumpbox-key
         secret:
           # Created by the workflow; holds id_ed25519 and id_ed25519.pub
-          secretName: rca-ci-jumpbox-key
+          secretName: ${JUMPBOX_KEY_SECRET}
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: rca-ci-jumpbox
+  name: ${JUMPBOX_NAME}
   labels:
-    app: rca-ci-jumpbox
+    app: ${JUMPBOX_NAME}
 spec:
   selector:
-    app: rca-ci-jumpbox
+    app: ${JUMPBOX_NAME}
   ports:
-  - port: 2222
-    targetPort: 2222
+  - port: ${JUMPBOX_PORT}
+    targetPort: ${JUMPBOX_PORT}
