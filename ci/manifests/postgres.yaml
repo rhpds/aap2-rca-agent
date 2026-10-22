@@ -1,39 +1,39 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: rca-ci-postgres
+  name: ${POSTGRES_NAME}
   labels:
-    app: rca-ci-postgres
+    app: ${POSTGRES_NAME}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: rca-ci-postgres
+      app: ${POSTGRES_NAME}
   template:
     metadata:
       labels:
-        app: rca-ci-postgres
+        app: ${POSTGRES_NAME}
     spec:
       containers:
       - name: postgres
         image: postgres:16-alpine
         env:
         - name: POSTGRES_USER
-          value: rca_test
+          value: ${DB_USER}
         - name: POSTGRES_PASSWORD
-          value: rca_test
+          value: ${DB_PASSWORD}
         - name: POSTGRES_DB
-          value: rca_test
+          value: ${DB_NAME}
         # OpenShift runs the pod as an arbitrary UID; the image can only
         # chmod a data directory it creates itself, so PGDATA must be a
         # subdirectory of the mounted volume.
         - name: PGDATA
           value: /var/lib/postgresql/data/pgdata
         ports:
-        - containerPort: 5432
+        - containerPort: ${DB_PORT}
         readinessProbe:
           exec:
-            command: ["pg_isready", "-U", "rca_test", "-d", "rca_test"]
+            command: ["pg_isready", "-U", "${DB_USER}", "-d", "${DB_NAME}"]
           initialDelaySeconds: 5
           periodSeconds: 5
           timeoutSeconds: 5
@@ -48,12 +48,12 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: rca-ci-postgres
+  name: ${POSTGRES_NAME}
   labels:
-    app: rca-ci-postgres
+    app: ${POSTGRES_NAME}
 spec:
   selector:
-    app: rca-ci-postgres
+    app: ${POSTGRES_NAME}
   ports:
-  - port: 5432
-    targetPort: 5432
+  - port: ${DB_PORT}
+    targetPort: ${DB_PORT}

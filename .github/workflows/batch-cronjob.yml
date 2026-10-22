@@ -29,13 +29,6 @@ concurrency:
   group: batch-cronjob
   cancel-in-progress: false
 
-env:
-  POSTGRES_NAME: rca-ci-postgres
-  JUMPBOX_NAME: rca-ci-jumpbox
-  JUMPBOX_KEY_SECRET: rca-ci-jumpbox-key
-  JOB_NAME: rca-ci-cronjob-run
-  WORKSPACE_POD: rca-ci-workspace
-
 jobs:
   cronjob:
     name: Install the chart and run one batch from the CronJob
@@ -44,11 +37,6 @@ jobs:
     if: ${{ github.event_name != 'pull_request_target' || github.event.label.name == 'safe-to-test' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      LITELLM_SECRET: claude-litellm-creds
-      RELEASE: rca-ci-cron
-      LOGS_DIR: /workspace/synthetic-logs
-      STATE_DIR: /workspace/.rca
     steps:
       # In pull_request_target context the default checkout would use the PR's
       # base branch; explicitly check out the PR head so the PR's code is what
@@ -57,10 +45,14 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      # Cluster access, namespace, images and oc. NS/IMAGE/SSHD_IMAGE (GITHUB_ENV) and oc
-      # (GITHUB_PATH) become available to every later step.
+      # CI config (ci/ci.env), cluster access, namespace, images and oc. The
+      # ci.env values, NS/IMAGE/SSHD_IMAGE (GITHUB_ENV) and oc (GITHUB_PATH)
+      # become available to every later step.
       - name: Set up cluster access and tools
         run: |
+          set -a; . ci/ci.env; set +a
+          grep -E '^[A-Z_]+=' ci/ci.env >> "$GITHUB_ENV"
+
           mkdir -p "$HOME/.kube"
           printf '%s' "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
@@ -109,9 +101,6 @@ jobs:
           EOF
           oc start-build rhdp-rca-plugin -n "$NS" --from-dir=. --wait
 
-      - name: Regenerate the synthetic job logs
-        run: python3 ci/synthetic-logs/generate.py
-
       - name: Generate CI jumpbox keypair
         run: |
           rm -f /tmp/ci_jumpbox_key /tmp/ci_jumpbox_key.pub
@@ -128,8 +117,10 @@ jobs:
 
       - name: Create CI Postgres and CI jumpbox
         run: |
-          kubectl apply -n "$NS" -f ci/manifests/postgres.yaml
-          sed "s|IMAGE_PLACEHOLDER|$SSHD_IMAGE|" ci/manifests/sshd.yaml | kubectl apply -n "$NS" -f -
+          envsubst '$POSTGRES_NAME $DB_NAME $DB_USER $DB_PASSWORD $DB_PORT' \
+            < ci/manifests/postgres.yaml | kubectl apply -n "$NS" -f -
+          envsubst '$JUMPBOX_NAME $JUMPBOX_KEY_SECRET $JUMPBOX_PORT $JUMPBOX_USER $SSHD_IMAGE' \
+            < ci/manifests/sshd.yaml | kubectl apply -n "$NS" -f -
           # The keypair is regenerated every run; force the sshd to pick up
           # the new authorized key rather than relying on secret-volume refresh.
           kubectl rollout restart deployment/$JUMPBOX_NAME -n "$NS"
@@ -138,8 +129,9 @@ jobs:
 
       - name: Install the chart with CI values
         run: |
-          # Image and SSH endpoints come from ci/values-cronjob.yaml; only
-          # secrets are passed here.
+          # ci/values-cronjob.yaml holds the chart shape; names, ports, model
+          # and DB settings come from ci/ci.env via --set-string and the
+          # generated settings JSON.
           # LiteLLM credentials are extracted from the in-cluster secret and
           # re-fed to Helm, which creates the chart's own secret from them.
           LITELLM_URL=$(kubectl get secret "$LITELLM_SECRET" -n "$NS" -o jsonpath='{.data.ANTHROPIC_BASE_URL}' | base64 -d)
@@ -149,11 +141,37 @@ jobs:
             exit 1
           fi
 
+          # The CronJob reaches Postgres through its own SSH tunnel, so the app
+          # sees it on localhost:$DB_TUNNEL_PORT.
+          jq -n --arg port "$DB_TUNNEL_PORT" '{env: {
+              SOURCE_DB_HOST: "localhost",
+              SOURCE_DB_PORT: $port,
+              SOURCE_DB_NAME: env.DB_NAME,
+              SOURCE_DB_USER: env.DB_USER,
+              SOURCE_DB_PASSWORD: env.DB_PASSWORD,
+              SOURCE_DB_TABLE: env.DB_TABLE,
+              SOURCE_DB_RESULT_TABLE: env.DB_RESULT_TABLE,
+              JOB_LOGS_DIR: env.LOGS_DIR
+            }}' > /tmp/settings-cronjob.json
+
           helm upgrade --install "$RELEASE" deploy/helm -n "$NS" \
             -f ci/values-cronjob.yaml \
+            --set-string claude.model="$CLAUDE_MODEL" \
+            --set-string cronjob.maxParallelJobs="$MAX_PARALLEL_JOBS" \
+            --set-string secrets.ssh.bastionHostname="$JUMPBOX_NAME" \
+            --set-string secrets.ssh.bastionUsername="$JUMPBOX_USER" \
+            --set-string secrets.ssh.bastionPort="$JUMPBOX_PORT" \
+            --set-string secrets.ssh.dbBastionHostname="$JUMPBOX_NAME" \
+            --set-string secrets.ssh.dbBastionUsername="$JUMPBOX_USER" \
+            --set-string secrets.ssh.dbBastionPort="$JUMPBOX_PORT" \
+            --set-string secrets.ssh.dbRemoteHost="$POSTGRES_NAME" \
+            --set-string secrets.ssh.dbRemotePort="$DB_PORT" \
+            --set-string secrets.ssh.jumpboxHostname="$JUMPBOX_NAME" \
+            --set-string secrets.ssh.jumpboxUsername="$JUMPBOX_USER" \
+            --set-string secrets.ssh.jumpboxPort="$JUMPBOX_PORT" \
             --set-string secrets.litellm.baseUrl="$LITELLM_URL" \
             --set-string secrets.litellm.apiKey="$LITELLM_KEY" \
-            --set-file secrets.skillConfig.settingsJson=ci/settings-cronjob.json \
+            --set-file secrets.skillConfig.settingsJson=/tmp/settings-cronjob.json \
             --set-file secrets.ssh.privateKey=/tmp/ci_jumpbox_key
 
       - name: Start workspace helper pod on the chart PVC
@@ -181,14 +199,16 @@ jobs:
           EOF
           kubectl wait --for=condition=ready "pod/$WORKSPACE_POD" -n "$NS" --timeout=180s
 
-      - name: Stage synthetic logs and seed the database
+      - name: Seed the database and stage synthetic logs
         run: |
-          kubectl exec -n "$NS" "$WORKSPACE_POD" -- mkdir -p "$LOGS_DIR" /tmp/ci
-          tar -C ci/synthetic-logs -cf - . | kubectl exec -i -n "$NS" "$WORKSPACE_POD" -- tar -xf - -C "$LOGS_DIR"
+          kubectl exec -n "$NS" "$WORKSPACE_POD" -- mkdir -p /tmp/ci
           kubectl exec -i -n "$NS" "$WORKSPACE_POD" -- bash -c "cat > /tmp/ci/seed_test_db.py" < ci/seed_test_db.py
-          kubectl exec -i -n "$NS" "$WORKSPACE_POD" -- bash -c "cat > /tmp/ci/settings.json" < ci/settings-localdb.json
-          kubectl exec -n "$NS" "$WORKSPACE_POD" -- \
-            env RCA_SETTINGS_FILE=/tmp/ci/settings.json JOB_LOGS_DIR="$LOGS_DIR" \
+          # The workspace pod talks to the Postgres Service directly (no tunnel).
+          kubectl exec -n "$NS" "$WORKSPACE_POD" -- env \
+            SOURCE_DB_HOST="$POSTGRES_NAME" SOURCE_DB_PORT="$DB_PORT" \
+            SOURCE_DB_NAME="$DB_NAME" SOURCE_DB_USER="$DB_USER" SOURCE_DB_PASSWORD="$DB_PASSWORD" \
+            SOURCE_DB_TABLE="$DB_TABLE" SOURCE_DB_RESULT_TABLE="$DB_RESULT_TABLE" \
+            JOB_LOGS_DIR="$LOGS_DIR" \
             python /tmp/ci/seed_test_db.py
 
       - name: Run one batch from the CronJob

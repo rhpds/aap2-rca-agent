@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Seed the CI test database with the synthetic job events.
+"""Generate synthetic AAP job logs and seed the CI test database.
 
-Creates the source/results tables and inserts one event row per job defined
-in synthetic-logs/generate.py, so the database and JOB_LOGS_DIR tell the same
-story. Timestamps are relative to now so --since windows work on every run.
+Writes job_{id}.json.gz files into JOB_LOGS_DIR (default: ci/synthetic-logs/
+next to this script), matching the ETL-extracted document shape that
+rca.analysis.job_parser.parse_job_log expects, then recreates the
+source/results tables and inserts one event row per job so the database and
+JOB_LOGS_DIR tell the same story. Timestamps are relative to now so --since
+windows work on every run.
 
 Database settings come from the same places rca-batch reads them:
 RCA_SETTINGS_FILE (settings.json env block) and the process environment,
@@ -11,17 +14,135 @@ falling back to the local docker-compose defaults.
 
 Splunk, GitHub, and Jira are intentionally left unconfigured: the batch's
 steps 2 and 4 record a skip and continue.
+
+The five jobs are designed around the batch's similarity thresholds:
+  900001/900002 - same catalog item, near-identical errors  -> dedup/pre-filter cluster
+  900003        - same catalog item, different error        -> below 0.75 threshold
+  900004        - other catalog item, error ~= 900003       -> cross-catalog (>= 0.90)
+  900005        - other catalog item, unique error          -> standalone analysis
 """
 
 from __future__ import annotations
 
-import importlib.util
+import gzip
+import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import psycopg2
+
+DEFAULT_LOGS_DIR = Path(__file__).resolve().parent / "synthetic-logs"
+
+JOBS = [
+    {
+        "job_id": 900001,
+        "job_name": "RHPDS zt-hp.zt-ocp4-get-started-cluster.dev-syn01-1-provision",
+        "guid": "syn01-1",
+        "cluster": "synthetic-cluster-a",
+        "template_id": 203390,
+        "duration": 1570,
+        "failed_task": {
+            "task": "Run security validation",
+            "play": "Step 004 Software",
+            "role": "ocp_workload_security_validation",
+            "task_action": "rhpds.security.validate_tenant_security",
+            "msg": (
+                "Task failed: Finalization of task args for 'rhpds.security.validate_tenant_security' "
+                "failed: 'cluster_admin_agnosticd_sa_token' is undefined"
+            ),
+        },
+    },
+    {
+        "job_id": 900002,
+        "job_name": "RHPDS zt-hp.zt-ocp4-get-started-cluster.dev-syn02-1-provision",
+        "guid": "syn02-1",
+        "cluster": "synthetic-cluster-a",
+        "template_id": 203390,
+        "duration": 1521,
+        "failed_task": {
+            "task": "Run security validation",
+            "play": "Step 004 Software",
+            "role": "ocp_workload_security_validation",
+            "task_action": "rhpds.security.validate_tenant_security",
+            "msg": (
+                "Task failed: Finalization of task args for 'rhpds.security.validate_tenant_security' "
+                "failed: 'cluster_admin_agnosticd_sa_token' is undefined"
+            ),
+        },
+    },
+    {
+        "job_id": 900003,
+        "job_name": "RHPDS zt-hp.zt-ocp4-get-started-cluster.dev-syn03-1-provision",
+        "guid": "syn03-1",
+        "cluster": "synthetic-cluster-a",
+        "template_id": 203390,
+        "duration": 2311,
+        "failed_task": {
+            "task": "Wait for router rollout to complete (IngressController available)",
+            "play": "Step 004 Software",
+            "role": "ocp4_workload_ingress",
+            "task_action": "kubernetes.core.k8s_info",
+            "msg": (
+                "Platform error: the IngressController operator reported Degraded=True - "
+                "ingress controller router-default failed to rollout within the timeout window"
+            ),
+        },
+    },
+    {
+        "job_id": 900004,
+        "job_name": "RHPDS zt-hp.zt-ocp4-ansible-automation.dev-syn04-2-provision",
+        "guid": "syn04-2",
+        "cluster": "synthetic-cluster-b",
+        "template_id": 204001,
+        "duration": 2087,
+        "failed_task": {
+            "task": "Wait for ingress to become available",
+            "play": "Step 005 Platform",
+            "role": "ocp4_workload_ingress",
+            "task_action": "kubernetes.core.k8s_info",
+            "msg": (
+                "Platform error: the IngressController operator reported Degraded=True - "
+                "ingress controller router-default failed to rollout within the timeout window"
+            ),
+        },
+    },
+    {
+        "job_id": 900005,
+        "job_name": "RHPDS zt-aws.zt-ocp4-virtualization-cluster.dev-syn05-3-provision",
+        "guid": "syn05-3",
+        "cluster": "synthetic-cluster-c",
+        "template_id": 203410,
+        "duration": 344,
+        "failed_task": {
+            "task": "Create worker node instance",
+            "play": "Step 002 Infrastructure",
+            "role": "ocp4_workload_aws_nodes",
+            "task_action": "amazon.aws.ec2_instance",
+            "msg": (
+                "Infrastructure error: AWSServiceError - Instance limit exceeded for instance "
+                "type m5.xlarge in availability zone us-east-1a (quota: Running On-Demand m5 instances)"
+            ),
+        },
+    },
+]
+
+PLAY_NAMES = [
+    "Step 0000 Install Galaxy roles and collections",
+    "Step 001 Pre Infrastructure",
+    "Step 002 Infrastructure",
+    "Step 003 Pre Software",
+    "Step 004 Software",
+    "Step 005 Platform",
+]
+ROLE_NAMES = [
+    "ocp4_workload_gitea_operator",
+    "ocp_workload_security_validation",
+    "ocp4_workload_ingress",
+    "ocp4_workload_aws_nodes",
+    "ocp4_workload_monitoring",
+]
 
 
 def _settings() -> dict[str, str]:
@@ -45,22 +166,239 @@ def _database_settings(env: dict[str, str]) -> dict[str, Any]:
     }
 
 
-def _load_job_specs(logs_dir: str | None) -> list[dict]:
-    candidates = [
-        Path(logs_dir) / "generate.py" if logs_dir else None,
-        Path(__file__).resolve().parent / "synthetic-logs" / "generate.py",
-    ]
-    generator = next((path for path in candidates if path and path.is_file()), None)
-    if generator is None:
-        raise FileNotFoundError(
-            "Could not find synthetic-logs/generate.py (looked in "
-            f"{logs_dir!r} and next to this script)"
+def _job_window(spec: dict, job_index: int, run_date: datetime) -> tuple[datetime, datetime]:
+    started = run_date - timedelta(minutes=30 + job_index * 7, seconds=job_index * 13)
+    return started, started + timedelta(seconds=spec["duration"])
+
+
+def _event(idx, kind, created, **extra):
+    event = {
+        "event_id": 1000 + idx,
+        "event": kind,
+        "created": created.isoformat(),
+        "counter": idx,
+        "stdout": "",
+        "verbosity": 0,
+    }
+    event.update(extra)
+    return event
+
+
+def build_document(spec: dict, job_index: int, run_date: datetime) -> dict:
+    job_id = spec["job_id"]
+    started, finished = _job_window(spec, job_index, run_date)
+    namespace = f"sandbox-{spec['guid']}-ocp4"
+    ft = spec["failed_task"]
+
+    events = []
+    idx = 0
+    events.append(_event(idx, "playbook_on_start", started, event_data={"playbook": "./ansible/site.yml"}))
+    idx += 1
+    for play in PLAY_NAMES:
+        events.append(
+            _event(idx, "playbook_on_play_start", started + timedelta(seconds=idx), play=play, event_data={"name": play})
         )
-    spec = importlib.util.spec_from_file_location("synthetic_generate", generator)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module.JOBS
+        idx += 1
+    # Namespace mention in verbose output
+    events.append(
+        _event(
+            idx,
+            "verbose",
+            started + timedelta(seconds=20),
+            stdout=f"TASK [ocp4_workload_namespace : Create project] namespace: {namespace} created",
+        )
+    )
+    idx += 1
+    # A couple of pod references
+    events.append(
+        _event(
+            idx,
+            "runner_on_ok",
+            started + timedelta(seconds=60),
+            task="Wait for pods",
+            stdout=f"pod/router-default-7d9c8b6f5-x2k9l is Running",
+        )
+    )
+    idx += 1
+    events.append(
+        _event(
+            idx,
+            "runner_on_ok",
+            started + timedelta(seconds=90),
+            task="Wait for pods",
+            stdout=f"pod/coordinator-5f7b8c9d1-mn3pq is Running",
+        )
+    )
+    idx += 1
+    # Some ordinary successful tasks
+    for n in range(12):
+        events.append(
+            _event(
+                idx,
+                "runner_on_ok",
+                started + timedelta(seconds=120 + n * 30),
+                task=f"Routine setup task {n}",
+                play=ft["play"],
+                role=ROLE_NAMES[n % len(ROLE_NAMES)],
+                event_data={"res": {"changed": True, "msg": "ok"}},
+            )
+        )
+        idx += 1
+    # Retries on the failing task
+    for n in range(3):
+        events.append(
+            _event(
+                idx,
+                "runner_retry",
+                started + timedelta(seconds=300 + n * 60),
+                task=ft["task"],
+                play=ft["play"],
+                role=ft["role"],
+                event_data={"res": {"msg": "Retrying task, attempt " + str(n + 1), "attempts": n + 1}},
+            )
+        )
+        idx += 1
+    # The terminal failure
+    events.append(
+        _event(
+            idx,
+            "runner_on_failed",
+            finished - timedelta(seconds=5),
+            failed=True,
+            task=ft["task"],
+            play=ft["play"],
+            role=ft["role"],
+            created_iso=finished.isoformat(),
+            event_data={
+                "res": {"msg": ft["msg"], "changed": False},
+                "task_path": f"/runner/requirements_collections/ansible_collections/rhpds/security/{ft['task_action']}.yml",
+                "task_action": ft["task_action"],
+                "duration": 0.02,
+            },
+        )
+    )
+    idx += 1
+
+    event_types: dict[str, int] = {}
+    for e in events:
+        event_types[e["event"]] = event_types.get(e["event"], 0) + 1
+
+    document = {
+        "job_id": job_id,
+        "extraction_timestamp": (finished + timedelta(seconds=92)).isoformat(),
+        "extractor_version": "1.0.0",
+        "data_sources": {
+            "metadata_available": True,
+            "events_available": True,
+            "retry_analysis_available": True,
+        },
+        "metadata": {
+            "extraction_metadata": {
+                "extraction_timestamp": (finished + timedelta(seconds=90)).isoformat(),
+                "extractor_version": "1.0",
+            },
+            "job_metadata": {
+                "job_id": job_id,
+                "job_name": spec["job_name"],
+                "status": "failed",
+                "created": started.isoformat(),
+                "started": started.isoformat(),
+                "finished": finished.isoformat(),
+                "duration_seconds": spec["duration"],
+                "elapsed": float(spec["duration"]) + 0.2,
+                "launch_type": "scheduled",
+                "failed": True,
+                "job_explanation": "",
+                "ansible_version": "",
+                "host_status_counts": {"changed": 13, "ok": 15},
+                "cloud_provider": "aws",
+                "guid": spec["guid"],
+                "sandbox_openshift_cluster": spec["cluster"],
+                "env_type": "sandbox",
+                "action": "provision",
+            },
+            "template_metadata": {
+                "template_id": spec["template_id"],
+                "template_name": spec["job_name"],
+                "template_description": "",
+                "organization_id": 2,
+            },
+            "git_context": {
+                "scm_url": None,
+                "scm_branch": None,
+                "scm_revision": None,
+                "scm_type": None,
+                "execution_environment_image": None,
+                "scm_ref": None,
+            },
+        },
+        "events_summary": {
+            "total_events": len(events),
+            "failed_events": 1,
+            "changed_events": 13,
+            "event_types": event_types,
+        },
+        "events": events,
+        "retry_analysis": {
+            "job_analysis": {
+                "total_plays": len(PLAY_NAMES),
+                "total_tasks": 18,
+                "tasks_with_retries": 1,
+                "total_retry_attempts": 3,
+                "retry_success_rate": 0.0,
+                "most_retried_task": {"name": ft["task"], "host": None, "retry_count": 3},
+                "analysis_timestamp": (finished + timedelta(seconds=91)).isoformat(),
+            },
+            "plays": [
+                {
+                    "play_name": play,
+                    "play_uuid": f"syn-{job_id}-{n:012d}",
+                    "start_time": started.isoformat(),
+                    "duration_seconds": spec["duration"] / len(PLAY_NAMES),
+                    "task_count": 3,
+                    "host_count": 1,
+                    "retry_count": 3 if play == ft["play"] else 0,
+                    "failed_task_count": 1 if play == ft["play"] else 0,
+                    "changed_task_count": 2,
+                }
+                for n, play in enumerate(PLAY_NAMES)
+            ],
+            "task_executions": [
+                {
+                    "task_name": ft["task"],
+                    "host_name": None,
+                    "play_name": ft["play"],
+                    "retry_count": 3,
+                    "total_attempts": 4,
+                    "final_outcome": "runner_on_failed",
+                    "duration_seconds": spec["duration"] / 4,
+                    "error_patterns": [ft["msg"][:60]],
+                    "first_attempt": (started + timedelta(seconds=300)).isoformat(),
+                    "final_completion": finished.isoformat(),
+                }
+            ],
+            "error_patterns": [{"pattern": ft["msg"].split(":", 1)[0], "frequency": 1}],
+        },
+        "extraction_metadata": {
+            "scratch_directory": f"/var/spool/aap2-etl/synthetic/scratch/extract/job_{job_id}",
+            "found_files": ["metadata.json", "events.jsonl", "retries.json"],
+            "missing_files": [],
+            "cluster_id": spec["cluster"],
+            "extraction_mode": "all",
+        },
+    }
+    return document
+
+
+def write_logs(logs_dir: Path, run_date: datetime) -> None:
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    for index, spec in enumerate(JOBS):
+        document = build_document(spec, index, run_date)
+        path = logs_dir / f"job_{spec['job_id']}.json.gz"
+        with gzip.open(path, "wt", encoding="utf-8") as stream:
+            json.dump(document, stream, ensure_ascii=False)
+            stream.write("\n")
+        print(f"wrote {path} ({path.stat().st_size} bytes)")
 
 
 def main() -> int:
@@ -68,27 +406,10 @@ def main() -> int:
     database = _database_settings(env)
     source_table = env.get("SOURCE_DB_TABLE") or "aap2_events"
     results_table = env.get("SOURCE_DB_RESULT_TABLE") or "aap2_job_results"
-    logs_dir = env.get("JOB_LOGS_DIR")
-    jobs = _load_job_specs(logs_dir)
-    now = datetime.now(timezone.utc)
+    logs_dir = Path(env.get("JOB_LOGS_DIR") or DEFAULT_LOGS_DIR)
+    run_date = datetime.now(timezone.utc)
 
-    # The batch reads job logs from JOB_LOGS_DIR and only falls back to a
-    # bastion fetch when a job id has no local log file. Refuse to seed ids
-    # without logs so the test never exercises (and never depends on) SSH.
-    if logs_dir:
-        missing = [
-            str(job["job_id"])
-            for job in jobs
-            if not any(Path(logs_dir).glob(f"job_{job['job_id']}.*"))
-        ]
-        if missing:
-            print(
-                f"ERROR: no job log files under {logs_dir} for job ids "
-                f"{', '.join(missing)}; the batch would try to fetch them "
-                "from a bastion host",
-                file=sys.stderr,
-            )
-            return 1
+    write_logs(logs_dir, run_date)
 
     schema_sql = f"""
     DROP TABLE IF EXISTS {results_table};
@@ -127,9 +448,8 @@ def main() -> int:
     try:
         with conn.cursor() as cur:
             cur.execute(schema_sql)
-            for index, job in enumerate(jobs):
-                started = now - timedelta(minutes=30 + index * 7, seconds=index * 13)
-                finished = started + timedelta(seconds=job["duration"])
+            for index, job in enumerate(JOBS):
+                started, finished = _job_window(job, index, run_date)
                 cur.execute(
                     f"""
                     INSERT INTO {source_table}
@@ -150,7 +470,7 @@ def main() -> int:
     finally:
         conn.close()
 
-    print(f"Seeded {len(jobs)} synthetic job event(s) into {database['dbname']}.{source_table}")
+    print(f"Seeded {len(JOBS)} synthetic job event(s) into {database['dbname']}.{source_table}")
     return 0
 
 
