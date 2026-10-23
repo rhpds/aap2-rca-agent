@@ -1,8 +1,8 @@
 # Values for the ArgoCD-managed deployment (deploy/argocd/application.yaml).
 # Mirrors the live rhdp-rca release so an ArgoCD sync only applies intended
-# changes. Secret data is intentionally empty: the real secrets already exist
-# in the rh-ace-aiops namespace and are protected by the Application's
-# ignoreDifferences on /data and /stringData.
+# changes. The real secrets already exist in the rh-ace-aiops namespace and are
+# kept out of ArgoCD management entirely (secrets.create: false below) because
+# a sync of chart-rendered secrets overwrites their live values.
 buildconfig:
   enabled: true
 
@@ -46,6 +46,11 @@ ssh:
   jumpboxAlias: ci-jumpbox
 
 secrets:
+  # ArgoCD must never render or patch the pre-existing secrets: a sync of the
+  # empty stringData below overwrites live secret values even with
+  # ignoreDifferences set, because the API server copies stringData into data
+  # on every apply. The real secrets are created out-of-band in the cluster.
+  create: false
   names:
     vertexCreds: claude-vertex-creds
     litellmCreds: claude-litellm-creds
