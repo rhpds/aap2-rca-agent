@@ -220,6 +220,19 @@ helm lint deploy/helm -f deploy/helm/values.example.yaml
 PostgreSQL integration tests use a separate local test database and skip when
 it is unavailable. Never point the test database settings at production.
 
+### GitOps (ArgoCD)
+
+`deploy/argocd/application.yaml` defines an ArgoCD Application that deploys
+the chart from this repository's `main` branch using
+`deploy/helm/values-gitops.yaml`, adopting the resources of the legacy
+`rhdp-rca` helm release in `rh-ace-aiops`. The application uses manual sync:
+ArgoCD reports drift, and changes are applied only when a sync is triggered
+deliberately. The CronJob is kept suspended via `cronjob.suspend` and is
+enabled by setting that value to `false`. Secret contents are managed
+out-of-band in the namespace and are excluded from syncing via
+`ignoreDifferences`; once the application is in place, helm must no longer be
+used to upgrade the `rhdp-rca` release.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
