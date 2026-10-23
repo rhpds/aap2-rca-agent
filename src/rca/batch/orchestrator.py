@@ -348,6 +348,43 @@ def _synthesis_prompt(job_id: str, artifacts: AnalysisArtifacts) -> str:
     )
 
 
+def _schema_allows_null(schema: Any) -> bool:
+    if not isinstance(schema, dict):
+        return True
+    schema_type = schema.get("type", [])
+    types = [schema_type] if isinstance(schema_type, str) else schema_type
+    return not types or "null" in types
+
+
+def _normalize_step5_value(value: Any, schema: Any = None) -> Any:
+    if isinstance(value, dict):
+        if not isinstance(schema, dict):
+            return value
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        if not isinstance(properties, dict) or not isinstance(required, list):
+            return value
+        normalized = {}
+        for key, child in value.items():
+            child_schema = properties.get(key)
+            if (
+                child is None
+                and key not in required
+                and not _schema_allows_null(child_schema)
+            ):
+                continue
+            normalized[key] = _normalize_step5_value(child, child_schema)
+        return normalized
+    if isinstance(value, list):
+        item_schema = schema.get("items") if isinstance(schema, dict) else None
+        return [_normalize_step5_value(item, item_schema) for item in value]
+    return value
+
+
+def _normalize_step5_summary(data: dict[str, Any]) -> dict[str, Any]:
+    return _normalize_step5_value(data, _SUMMARY_OUTPUT_SCHEMA)
+
+
 def _read_step5_summary(artifacts: AnalysisArtifacts) -> dict[str, Any]:
     path = artifacts.analysis_dir / "step5_analysis_summary.json"
     if not path.is_file():
@@ -359,6 +396,7 @@ def _read_step5_summary(artifacts: AnalysisArtifacts) -> dict[str, Any]:
         raise ValueError(f"Could not read Step 5 summary {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise ValueError(f"Step 5 summary must contain a JSON object: {path}")
+    data = _normalize_step5_summary(data)
     try:
         jsonschema.validate(instance=data, schema=_SUMMARY_OUTPUT_SCHEMA)
     except jsonschema.ValidationError as exc:

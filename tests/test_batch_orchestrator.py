@@ -233,6 +233,93 @@ def test_step5_summary_rejects_schema_invalid_output(tmp_path: Path) -> None:
         orchestrator._read_step5_summary(artifacts)
 
 
+def test_step5_summary_omits_null_optional_fields(
+    tmp_path: Path,
+) -> None:
+    analysis_dir = tmp_path / ".analysis" / "123"
+    analysis_dir.mkdir(parents=True)
+    summary = {
+        "job_id": "123",
+        "root_cause": {
+            "summary": "Unknown cause",
+            "category": "unknown",
+            "confidence": "low",
+        },
+        "correlation": {
+            "method": "none",
+            "identifiers": {
+                "guid": "guid-1",
+                "namespace": None,
+                "pod_name": None,
+            },
+            "time_overlap": {
+                "aap_job_start": "2026-10-22T19:00:00Z",
+                "aap_job_end": "2026-10-22T19:01:00Z",
+                "splunk_first_error": None,
+                "splunk_last_error": None,
+                "overlap_confirmed": False,
+            },
+        },
+        "evidence": [
+            {
+                "source": "aap_job",
+                "timestamp": "2026-10-22T19:00:00Z",
+                "message": "Task failed",
+                "github_path": None,
+            }
+        ],
+        "recommendations": [
+            {"priority": None, "action": "Gather more evidence", "evidence_ref": None}
+        ],
+    }
+    (analysis_dir / "step5_analysis_summary.json").write_text(
+        json.dumps(summary), encoding="utf-8"
+    )
+    artifacts = AnalysisArtifacts("123", analysis_dir, {}, {}, {}, {})
+
+    result = orchestrator._read_step5_summary(artifacts)
+
+    identifiers = result["correlation"]["identifiers"]
+    time_overlap = result["correlation"]["time_overlap"]
+    assert identifiers == {"guid": "guid-1"}
+    assert "splunk_first_error" not in time_overlap
+    assert "splunk_last_error" not in time_overlap
+    assert time_overlap["aap_job_start"] == "2026-10-22T19:00:00Z"
+    assert time_overlap["overlap_confirmed"] is False
+    assert "github_path" not in result["evidence"][0]
+    assert result["recommendations"] == [
+        {"action": "Gather more evidence", "evidence_ref": None}
+    ]
+
+
+def test_step5_summary_preserves_null_required_fields() -> None:
+    summary = {
+        "job_id": "123",
+        "root_cause": {
+            "summary": None,
+            "category": "unknown",
+            "confidence": "low",
+        },
+        "correlation": {
+            "method": None,
+            "identifiers": {"guid": "guid-1", "pod_name": None},
+        },
+        "evidence": [
+            {
+                "source": "aap_job",
+                "timestamp": "2026-10-22T19:00:00Z",
+                "message": "Task failed",
+            }
+        ],
+    }
+
+    normalized = orchestrator._normalize_step5_summary(summary)
+
+    assert normalized["root_cause"]["summary"] is None
+    assert normalized["correlation"]["method"] is None
+    assert "pod_name" not in normalized["correlation"]["identifiers"]
+
+
 def test_sdk_result_usage_and_semaphore_limit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

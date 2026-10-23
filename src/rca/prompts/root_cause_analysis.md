@@ -88,6 +88,9 @@ Produce a JSON object with:
 - `recommendations`: specific, actionable changes grounded in the supplied
   evidence, with `github_path` and `evidence_ref` when applicable.
 
+Omit optional summary fields when their value is unavailable instead of using
+`null`.
+
 A high confidence rating requires direct, mutually consistent evidence.
 Otherwise use medium or low confidence. If the artifacts are insufficient,
 return a low-confidence summary with an explicit unknown cause rather than
