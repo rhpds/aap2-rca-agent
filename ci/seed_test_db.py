@@ -432,16 +432,20 @@ def main() -> int:
         job_id BIGINT NOT NULL,
         status TEXT,
         root_cause_category TEXT,
-        root_cause_summary TEXT,
+        root_cause JSONB,
+        related_result_id INTEGER REFERENCES {results_table}(id),
+        related_result_confidence TEXT
+            CHECK (related_result_confidence IN ('high', 'medium', 'low')),
         confidence TEXT,
         catalog_item TEXT,
         job_duration_seconds INTEGER,
-        cross_job_pattern TEXT,
-        cross_job_pattern_description TEXT,
         ticket_link TEXT,
         ticket_resolve_datetime_gmt TIMESTAMPTZ,
         CONSTRAINT results_batch_job_unique UNIQUE (batch_id, job_id)
     );
+
+    CREATE INDEX {results_table}_related_result_id_idx
+        ON {results_table}(related_result_id);
     """
 
     conn = psycopg2.connect(**database)
