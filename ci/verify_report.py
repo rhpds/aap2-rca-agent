@@ -27,6 +27,7 @@ def main() -> int:
 
     assert requested >= 1, "no jobs were requested"
     assert analyzed >= 1, "batch analyzed no jobs successfully"
+    assert failed == 0, f"{failed} job(s) failed analysis"
     print("OK")
     return 0
 
