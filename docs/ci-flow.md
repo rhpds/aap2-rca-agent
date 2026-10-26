@@ -44,99 +44,39 @@ flowchart TD
 
 ## `batch-cronjob.yml`
 
-### Trigger, gate and setup
-
 ```mermaid
 flowchart TD
-    T1([push to ocp-testing]) --> G
-    T2([pull_request_target: labeled]) --> G
-    T3([workflow_dispatch]) --> G
-
-    G{"event is pull_request_target<br/>and label is not safe-to-test?"}
-    G -- yes --> SKIP([job skipped])
-    G -- no --> C["concurrency group: batch-cronjob<br/>(queued, never cancelled)"]
-
-    C --> CO["checkout<br/>PR head SHA, or github.sha"]
-    CO --> SETUP
-
-    subgraph SETUP["Set up cluster access and tools (one step)"]
-        KC["Write kubeconfig<br/>from secrets.KUBECONFIG_B64"] --> NSK["namespace from kubeconfig context"]
-        NSK --> NSE{"namespace empty?"}
-        NSE -- no --> VA["kubectl get namespace<br/>(verify access)"]
-        VA --> IMGD["export NS, IMAGE, SSHD_IMAGE<br/>(internal registry, $NS/…:latest)"]
-        IMGD --> OC["install oc → $HOME/bin<br/>(added to GITHUB_PATH)"]
-    end
-    NSE -- yes --> FAIL1([fail])
-    OC --> BUILD
+    T([push to ocp-testing<br/>PR labeled safe-to-test<br/>workflow_dispatch]) --> G{"PR event without<br/>the safe-to-test label?"}
+    G -- yes --> SKIP([skipped])
+    G -- no --> SETUP["Connect to the cluster<br/>kubeconfig secret, namespace, oc"]
+    SETUP --> BUILD["Build images in the cluster<br/>rca app (this commit) + CI jumpbox"]
+    BUILD --> INFRA["Deploy synthetic infrastructure<br/>CI Postgres + CI SSH jumpbox with a fresh keypair"]
+    INFRA --> HELM["helm install the real chart<br/>values from ci/ci.env, LiteLLM creds from the cluster"]
+    HELM --> SEED["Seed Postgres and write<br/>synthetic job logs to the chart PVC"]
+    SEED --> RUN["Run one Job from the CronJob<br/>wait until it completes, fails or times out"]
+    RUN --> VERIFY["Verify the batch report<br/>and the result uploads on the jumpbox"]
+    VERIFY --> ART["Always: upload report and logs as an artifact"]
+    ART --> CLEAN["Delete CI resources<br/>unless CI_SKIP_CLEANUP=true"]
 ```
 
-### Building images and synthetic infrastructure
-
-```mermaid
-flowchart TD
-    BUILD["apply ImageStream + BuildConfig<br/>oc start-build --from-dir=. --wait"]
-
-    BUILD --> KEY["ssh-keygen ed25519<br/>→ secret rca-ci-jumpbox-key"]
-
-    KEY --> SB1["oc new-build rca-ci-jumpbox<br/>oc start-build --from-dir=ci/images/sshd"]
-
-    SB1 --> INFRA["apply ci/manifests/postgres.yaml<br/>apply ci/manifests/sshd.yaml (SSHD_IMAGE)<br/>rollout restart jumpbox (pick up new key)<br/>wait for both rollouts"]
-    INFRA --> HELM
-```
-
-### Chart install, seeding and the batch run
-
-```mermaid
-flowchart TD
-    HELM["Read ANTHROPIC_BASE_URL / API_KEY<br/>from litellm secret"] --> LLC{"both present?"}
-    LLC -- no --> FAIL3([fail])
-    LLC -- yes --> HI["jq: settings JSON from ci/ci.env<br/>(SOURCE_DB_* → localhost:15432 tunnel)<br/>helm upgrade --install -f ci/values-cronjob.yaml<br/>--set from ci/ci.env: model, parallelism, SSH endpoints<br/>(bastion / db-bastion / jumpbox → rca-ci-jumpbox:2222,<br/>db remote → rca-ci-postgres:5432)<br/>--set: litellm creds, settings JSON, ssh key"]
-
-    HI --> WP["Start rca-ci-workspace pod<br/>(IMAGE, mounts $RELEASE-pvc at /workspace)<br/>wait Ready"]
-    WP --> ST["copy seed_test_db.py into workspace pod<br/>SOURCE_DB_* from ci/ci.env passed inline<br/>(direct to rca-ci-postgres:5432)"]
-    ST --> SEED["seed_test_db.py in workspace pod:<br/>write job_*.json.gz into JOB_LOGS_DIR,<br/>create tables, insert one event per job"]
-
-    SEED --> RUN["kubectl create job rca-ci-cronjob-run<br/>--from=cronjob/$RELEASE-batch"]
-    RUN --> WAIT
-```
+- **Trust gate:** `pull_request_target` runs the PR's code with cluster credentials, so
+  PR runs only start when a maintainer adds the `safe-to-test` label.
+- **One run at a time:** runs share a concurrency group and queue rather than cancel.
+- **Fail fast:** if any step fails, the run skips straight to artifact upload and cleanup.
+- **What is checked:** `ci/verify_report.py` checks the report's structure and counts, not the LLM text.
+  Every job marked `analyzed` must also have an upload directory on the jumpbox.
 
 ### What the batch Job does in the cluster
 
+The chart's SSH settings point at the CI jumpbox and its database settings at the CI Postgres,
+so the CronJob uses its normal tunnel and upload paths against synthetic infrastructure only.
+
 ```mermaid
 flowchart LR
-    subgraph Job["rca-ci-cronjob-run pod"]
-        INIT["init: setup-ssh<br/>write ssh config + key"] --> MAIN["rca-batch"]
-    end
-    MAIN -- "SSH tunnel" --> JB["rca-ci-jumpbox<br/>(sshd :2222)"]
-    JB -- "port forward" --> PG[("rca-ci-postgres<br/>:5432")]
-    MAIN -- "read logs" --> PVC[("$RELEASE-pvc<br/>/workspace/synthetic-logs")]
-    MAIN -- "LLM calls" --> LLM["LiteLLM<br/>(ANTHROPIC_BASE_URL)"]
-    MAIN -- "upload results<br/>over SSH" --> JB2["rca-ci-jumpbox<br/>/usr/local/mlflow/&lt;job_id&gt;"]
-    MAIN -- "write report" --> REP[("/workspace/.rca/reports/<br/>batch_*.json")]
-    MAIN -. "Splunk / GitHub / Jira<br/>not configured" .-> SKIPPED[steps 2 and 4 skipped]
-```
-
-### Waiting, verification and cleanup
-
-```mermaid
-flowchart TD
-    WAIT["ci/wait_for_job.sh<br/>poll every 10s"] --> W1{"Job condition<br/>Failed=True?"}
-    W1 -- yes --> WF["dump job logs"] --> FAIL4([fail])
-    W1 -- no --> W2{"Complete=True?"}
-    W2 -- yes --> REPORT
-    W2 -- no --> W3{"past WAIT_TIMEOUT_SECS<br/>(default 1200)?"}
-    W3 -- yes --> WF
-    W3 -- no --> WAIT
-
-    REPORT["Find newest batch_*.json in workspace pod<br/>copy to out/batch_report.json<br/>save job logs → out/batch.log"] --> VR["python3 ci/verify_report.py<br/>(structure + counts, not LLM text)"]
-    VR -- fail --> FAIL5([fail])
-    VR -- pass --> UP["List /usr/local/mlflow on jumpbox<br/>ANALYZED = job_ids with status 'analyzed'"]
-    UP --> UPC{"every analyzed job_id<br/>has an upload dir?"}
-    UPC -- no --> FAIL6([fail])
-    UPC -- yes --> OK([success])
-
-    OK & FAIL4 & FAIL5 & FAIL6 --> ART["always: upload out/ as artifact<br/>batch-cronjob-run"]
-    ART --> CL{"vars.CI_SKIP_CLEANUP == 'true'?"}
-    CL -- no --> CLN["helm uninstall<br/>delete job, workspace pod,<br/>postgres, jumpbox, key secret"]
-    CL -- yes --> NOTE["::notice:: resources left<br/>for inspection"]
+    JOB["Batch Job<br/>(from the chart's CronJob)"] -- "SSH tunnel" --> JB["CI jumpbox"]
+    JB --> PG[("CI Postgres")]
+    JOB -- "upload results over SSH" --> JB
+    JOB -- "read logs, write report" --> PVC[("chart PVC")]
+    JOB -- "LLM calls" --> LLM["LiteLLM"]
+    JOB -. "not configured" .-> SKIPPED["Splunk / GitHub / Jira<br/>steps skipped"]
 ```
