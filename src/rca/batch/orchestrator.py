@@ -12,6 +12,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -20,11 +21,12 @@ from pathlib import Path
 from string import Template
 from typing import Any, Mapping
 
-import jsonschema
 import psycopg2
 import psycopg2.extras
 from psycopg2.pool import ThreadedConnectionPool
+from pydantic import ValidationError
 
+from rca.analysis.bastion_resolver import ensure_jumpbox_alias
 from rca.analysis.jumpbox_io import upload_to_jumpbox
 from rca.analysis.pipeline import AnalysisArtifacts, run_analysis
 from rca.analysis.tracing import set_pipeline_tracing_enabled
@@ -45,6 +47,8 @@ from rca.batch.store_report import (
 )
 from rca.config import Config
 from rca.database import pooled_connection
+from rca.models import AnalysisSummary, BatchReport, BatchSemanticOutput
+from rca.models.base import format_validation_errors
 
 logger = logging.getLogger("rca.batch")
 
@@ -66,28 +70,8 @@ _VALID_CATEGORIES = set(_CATEGORY_NAMES)
 _CATEGORY_ALIASES = {"workload_bug": "application_bug", "credential": "secrets"}
 _VALID_CONFIDENCE = {"high", "medium", "low"}
 
-_SEMANTIC_OUTPUT_SCHEMA: dict[str, Any] = json.loads(
-    files("rca")
-    .joinpath("schemas")
-    .joinpath("batch_semantic_output.schema.json")
-    .read_text(encoding="utf-8")
-)
-_SUMMARY_OUTPUT_SCHEMA: dict[str, Any] = json.loads(
-    files("rca")
-    .joinpath("schemas")
-    .joinpath("summary.schema.json")
-    .read_text(encoding="utf-8")
-)
-_SUMMARY_OUTPUT_FORMAT = {
-    "type": "json_schema",
-    "schema": _SUMMARY_OUTPUT_SCHEMA,
-}
-_BATCH_REPORT_SCHEMA: dict[str, Any] = json.loads(
-    files("rca")
-    .joinpath("schemas")
-    .joinpath("batch_report.structured_output.schema.json")
-    .read_text(encoding="utf-8")
-)
+_SEMANTIC_OUTPUT_SCHEMA = BatchSemanticOutput.model_json_schema()
+_SUMMARY_OUTPUT_SCHEMA = AnalysisSummary.model_json_schema()
 
 
 def _load_prompt(filename: str) -> str:
@@ -243,17 +227,18 @@ def _as_model_usage_mapping(value: Any) -> dict[str, dict[str, Any]]:
     }
 
 
-def _result_error_text(message: Any) -> str:
-    errors = getattr(message, "errors", None)
-    if isinstance(errors, (list, tuple)):
-        details = "; ".join(str(error) for error in errors if error)
-        if details:
-            return details[:1000]
-    text = getattr(message, "result", None)
-    if isinstance(text, str) and text.strip():
-        return text.strip()[:1000]
-    subtype = getattr(message, "subtype", None)
-    return f"Agent SDK query failed{f' ({subtype})' if subtype else ''}"
+def _accumulate_sdk_usage(total: dict[str, Any], usage: Mapping[str, Any]) -> None:
+    """Add per-turn counters, retaining the latest non-counter metadata."""
+    for key, value in usage.items():
+        if isinstance(value, Mapping):
+            if not isinstance(total.get(key), dict):
+                total[key] = {}
+            _accumulate_sdk_usage(total[key], value)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            previous = total.get(key, 0)
+            total[key] = (previous if isinstance(previous, (int, float)) else 0) + value
+        else:
+            total[key] = value
 
 
 def _make_sdk_options(
@@ -287,6 +272,7 @@ def _make_sdk_options(
         kwargs["tools"] = []
     if output_format is not None:
         kwargs["output_format"] = output_format
+        kwargs.setdefault("allowed_tools", []).append("StructuredOutput")
     return sdk.ClaudeAgentOptions(**kwargs)
 
 
@@ -309,15 +295,26 @@ async def _run_sdk_query(
     )
 
     terminal_message = None
+    usage: dict[str, Any] = {}
+    sdk_result_error = getattr(sdk, "ResultError", ())
     async with semaphore:
-        async with sdk.ClaudeSDKClient(options=options) as client:
-            await client.query(prompt)
-            async for message in client.receive_response():
-                if _is_result_message(message):
-                    terminal_message = message
-
-    if terminal_message is None:
-        raise RuntimeError("Agent SDK query ended without a terminal result")
+        try:
+            async with sdk.ClaudeSDKClient(options=options) as client:
+                await client.query(prompt)
+                async for message in client.receive_response():
+                    if _is_result_message(message):
+                        terminal_message = message
+                        _accumulate_sdk_usage(
+                            usage, _as_usage_mapping(getattr(message, "usage", None))
+                        )
+                if terminal_message is None:
+                    raise RuntimeError("Agent SDK query ended without a terminal result")
+        except sdk_result_error:
+            # The SDK can raise after yielding an error result when its CLI
+            # exits nonzero. Retain the error and accounting without retrying
+            # a client that has already exited.
+            if terminal_message is None or not terminal_message.is_error:
+                raise
 
     raw_cost = getattr(terminal_message, "total_cost_usd", None)
     try:
@@ -328,18 +325,19 @@ async def _run_sdk_query(
         cost = None
 
     text = getattr(terminal_message, "result", None)
+    errors = tuple(
+        str(error)
+        for error in (getattr(terminal_message, "errors", None) or [])
+        if error
+    )
     return SDKQueryResult(
         is_error=bool(getattr(terminal_message, "is_error", False)),
         cost_usd=cost,
-        usage=_as_usage_mapping(getattr(terminal_message, "usage", None)),
+        usage=usage,
         text=text if isinstance(text, str) else "",
         model_usage=_as_model_usage_mapping(getattr(terminal_message, "model_usage", None)),
         structured_output=getattr(terminal_message, "structured_output", None),
-        errors=tuple(
-            str(error)
-            for error in (getattr(terminal_message, "errors", None) or [])
-            if error
-        ),
+        errors=errors,
         session_id=getattr(terminal_message, "session_id", None),
     )
 
@@ -347,67 +345,43 @@ async def _run_sdk_query(
 def _synthesis_prompt(job_id: str, artifacts: AnalysisArtifacts) -> str:
     return _SYNTHESIS_PROMPT_TEMPLATE.substitute(
         job_id=job_id,
+        analysis_dir=artifacts.analysis_dir,
         summary_path=artifacts.analysis_dir / "step5_analysis_summary.json",
+        summary_schema=json.dumps(_SUMMARY_OUTPUT_SCHEMA, indent=2, ensure_ascii=False),
     )
 
 
-def _schema_allows_null(schema: Any) -> bool:
-    if not isinstance(schema, dict):
-        return True
-    schema_type = schema.get("type", [])
-    types = [schema_type] if isinstance(schema_type, str) else schema_type
-    return not types or "null" in types
+async def _run_synthesis(
+    prompt: str,
+    config: Config,
+    *,
+    artifacts: AnalysisArtifacts,
+    cwd: Path,
+    semaphore: asyncio.Semaphore,
+    summary_job_id: str,
+) -> SDKQueryResult:
+    """Investigate and return the structured summary in one Agent SDK query."""
+    output_schema = deepcopy(_SUMMARY_OUTPUT_SCHEMA)
+    output_schema["properties"]["job_id"]["enum"] = [str(summary_job_id)]
+    return await _run_sdk_query(
+        prompt,
+        config,
+        cwd=cwd,
+        semaphore=semaphore,
+        system_prompt=RCA_INSTRUCTIONS,
+        output_format={"type": "json_schema", "schema": output_schema},
+    )
 
 
-def _normalize_step5_value(value: Any, schema: Any = None) -> Any:
-    if isinstance(value, dict):
-        if not isinstance(schema, dict):
-            return value
-        properties = schema.get("properties", {})
-        required = schema.get("required", [])
-        if not isinstance(properties, dict) or not isinstance(required, list):
-            return value
-        normalized = {}
-        for key, child in value.items():
-            child_schema = properties.get(key)
-            if (
-                child is None
-                and key not in required
-                and not _schema_allows_null(child_schema)
-            ):
-                continue
-            normalized[key] = _normalize_step5_value(child, child_schema)
-        return normalized
-    if isinstance(value, list):
-        item_schema = schema.get("items") if isinstance(schema, dict) else None
-        return [_normalize_step5_value(item, item_schema) for item in value]
-    return value
-
-
-def _normalize_step5_summary(data: dict[str, Any]) -> dict[str, Any]:
-    return _normalize_step5_value(data, _SUMMARY_OUTPUT_SCHEMA)
-
-
-def _read_step5_summary(artifacts: AnalysisArtifacts) -> dict[str, Any]:
+def _write_step5_summary(artifacts: AnalysisArtifacts, summary: dict[str, Any]) -> None:
     path = artifacts.analysis_dir / "step5_analysis_summary.json"
-    if not path.is_file():
-        raise FileNotFoundError(f"Step 5 summary was not created: {path}")
+    temporary_path = path.with_suffix(".json.tmp")
+    content = json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
     try:
-        with path.open(encoding="utf-8") as stream:
-            data = json.load(stream)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Could not read Step 5 summary {path}: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ValueError(f"Step 5 summary must contain a JSON object: {path}")
-    data = _normalize_step5_summary(data)
-    try:
-        jsonschema.validate(instance=data, schema=_SUMMARY_OUTPUT_SCHEMA)
-    except jsonschema.ValidationError as exc:
-        location = ".".join(str(part) for part in exc.absolute_path) or "$"
-        raise ValueError(
-            f"Step 5 summary failed schema validation at {location}: {exc.message}"
-        ) from exc
-    return data
+        temporary_path.write_text(content, encoding="utf-8")
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 async def _execute_one_job(
@@ -439,17 +413,19 @@ async def _execute_one_job(
             stage="analysis_pipeline",
         )
 
+    summary_path = artifacts.analysis_dir / "step5_analysis_summary.json"
+    summary_written = False
     try:
-        # A retry reuses the job directory; only a summary written by this
-        # query may qualify the current execution as successful.
-        (artifacts.analysis_dir / "step5_analysis_summary.json").unlink(missing_ok=True)
-        result = await _run_sdk_query(
+        # A retry reuses the job directory. Only this query's returned
+        # structured output may become the new summary artifact.
+        summary_path.unlink(missing_ok=True)
+        result = await _run_synthesis(
             _synthesis_prompt(rendered_id, artifacts),
             config,
+            artifacts=artifacts,
             cwd=cwd,
             semaphore=sdk_semaphore,
-            system_prompt=RCA_INSTRUCTIONS,
-            output_format=_SUMMARY_OUTPUT_FORMAT,
+            summary_job_id=rendered_id,
         )
         if result.is_error:
             detail = "; ".join(result.errors) or result.text or "agent reported an error"
@@ -464,7 +440,12 @@ async def _execute_one_job(
                 usage=result.usage,
                 model_usage=result.model_usage,
             )
-        summary = _read_step5_summary(artifacts)
+        if result.structured_output is None:
+            raise FileNotFoundError("Step 5 summary was not returned as structured output")
+        # Save the SDK response unchanged; structured generation is SDK-managed.
+        summary = result.structured_output
+        _write_step5_summary(artifacts, summary)
+        summary_written = True
     except FileNotFoundError as exc:
         return JobExecution(
             job_id=rendered_id,
@@ -489,6 +470,12 @@ async def _execute_one_job(
             usage=result.usage if result else None,
             model_usage=result.model_usage if result else None,
         )
+    finally:
+        if not summary_written:
+            try:
+                summary_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Job %s: could not remove rejected summary", rendered_id)
 
     if not dry_run:
         try:
@@ -762,6 +749,12 @@ async def _aggregate_semantics(
         detail = "; ".join(result.errors) or result.text or "agent reported an error"
         raise RuntimeError(f"Semantic batch aggregation failed: {detail[:1000]}")
     output = _normalize_json_output(result)
+    try:
+        BatchSemanticOutput.model_validate(output)
+    except ValidationError as exc:
+        raise ValueError(
+            "Semantic batch output failed schema validation at " + format_validation_errors(exc)
+        ) from exc
     normalized = _normalize_semantics(output, job_summaries, known_issues)
     return normalized["cross_job_patterns"], result
 
@@ -1048,11 +1041,10 @@ def _json_default(value: Any) -> Any:
 
 def _validate_batch_report(report: dict[str, Any]) -> None:
     try:
-        jsonschema.validate(instance=report, schema=_BATCH_REPORT_SCHEMA)
-    except jsonschema.ValidationError as exc:
-        location = ".".join(str(part) for part in exc.absolute_path) or "$"
+        BatchReport.model_validate(report)
+    except ValidationError as exc:
         raise ValueError(
-            f"Batch report failed schema validation at {location}: {exc.message}"
+            "Batch report failed schema validation at " + format_validation_errors(exc)
         ) from exc
 
 
@@ -1218,7 +1210,11 @@ def _log_mlflow_usage(
                         totals=model_usage_totals,
                     )
 
-                mlflow.log_metric("batch_cost_usd", total_cost)
+                costs_complete = all(item.cost_usd is not None for item in job_executions)
+                if aggregation_result is not None:
+                    costs_complete = costs_complete and aggregation_result.cost_usd is not None
+                if costs_complete:
+                    mlflow.log_metric("batch_cost_usd", total_cost)
                 for key, value in usage_totals.items():
                     mlflow.log_metric(f"batch_{key}", value)
                 for (model, metric), value in sorted(model_usage_totals.items()):
@@ -1494,6 +1490,13 @@ def run_batch(
             prepare_jira_tickets({"batch_id": batch_id, "job_summaries": []})
             logger.info("[SUCCESS] Batch RCA completed")
             return 0
+
+        if not dry_run:
+            try:
+                ensure_jumpbox_alias(config)
+            except Exception as exc:
+                logger.error("Failed to prepare jumpbox SSH alias: %s", exc)
+                return 1
 
         logger.info(
             "[STEP 2] Running deterministic analysis and Agent SDK synthesis for %d job(s)",

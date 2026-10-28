@@ -6,7 +6,9 @@ flowchart TD
 high-confidence match"}
     C -->|yes| D["store_pre_matched()"]
     C -->|no| E["_analyze_jobs()
-fetch logs, run analysis"]
+fetch logs, run deterministic Steps 1-4,
+Step 5 Agent SDK structured summary,
+verified upload"]
 
     E -->|fails| F["_recover_failed_representatives()
 retry duplicates"]
