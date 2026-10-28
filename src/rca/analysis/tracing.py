@@ -10,7 +10,7 @@ try:
 except ImportError:
     mlflow = None  # noqa: N816
     SpanType = None
-HAS_MLFLOW = False
+    HAS_MLFLOW = False
 
 _pipeline_tracing_enabled = True
 
