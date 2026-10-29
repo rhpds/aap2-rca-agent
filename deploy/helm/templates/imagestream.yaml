@@ -1,0 +1,7 @@
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: {{ .Values.image.name }}
+  labels:
+    {{- include "rhdp-rca.labels" . | nindent 4 }}
+spec: {}
