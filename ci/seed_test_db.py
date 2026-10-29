@@ -433,6 +433,7 @@ def main() -> int:
         status TEXT,
         root_cause_category TEXT,
         root_cause JSONB,
+        recommendation JSONB,
         related_result_id INTEGER REFERENCES {results_table}(id),
         related_result_confidence TEXT
             CHECK (related_result_confidence IN ('high', 'medium', 'low')),
