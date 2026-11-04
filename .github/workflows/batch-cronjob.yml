@@ -212,14 +212,20 @@ jobs:
 
       - name: Fetch and verify the batch report
         run: |
+          # Capture the batch logs before removing the pod, which holds them.
+          mkdir -p out
+          kubectl logs -n "$NS" "job/$JOB_NAME" --all-containers > out/batch.log || true
+          # The completed Job pod still holds the ReadWriteOnce volume's node
+          # attachment. Delete it (the Job object stays for debugging) so the
+          # recreated workspace pod can attach on any node instead of racing
+          # Multi-Attach detach against the --timeout below.
+          kubectl delete pod -n "$NS" -l "job-name=$JOB_NAME" --ignore-not-found
           envsubst '$WORKSPACE_POD $IMAGE $RELEASE' \
             < ci/manifests/workspace-pod.yaml | kubectl apply -n "$NS" -f -
           kubectl wait --for=condition=ready "pod/$WORKSPACE_POD" -n "$NS" --timeout=180s
           REPORT=$(kubectl exec -n "$NS" "$WORKSPACE_POD" -- bash -c "ls -1t $STATE_DIR/reports/batch_*.json | head -1")
           echo "report: $REPORT"
-          mkdir -p out
           kubectl exec -n "$NS" "$WORKSPACE_POD" -- cat "$REPORT" > out/batch_report.json
-          kubectl logs -n "$NS" "job/$JOB_NAME" --all-containers > out/batch.log || true
           python3 ci/verify_report.py out/batch_report.json
 
       - name: Verify uploads landed on the CI jumpbox
