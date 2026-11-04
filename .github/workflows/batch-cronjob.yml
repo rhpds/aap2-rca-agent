@@ -190,6 +190,7 @@ jobs:
           kubectl exec -i -n "$NS" "$WORKSPACE_POD" -- bash -c "cat > /tmp/ci/seed_test_db.py" < ci/seed_test_db.py
           # The workspace pod talks to the Postgres Service directly (no tunnel).
           kubectl exec -n "$NS" "$WORKSPACE_POD" -- env \
+            RCA_CI_SEED_CONFIRM=1 \
             SOURCE_DB_HOST="$POSTGRES_NAME" SOURCE_DB_PORT="$DB_PORT" \
             SOURCE_DB_NAME="$DB_NAME" SOURCE_DB_USER="$DB_USER" SOURCE_DB_PASSWORD="$DB_PASSWORD" \
             SOURCE_DB_TABLE="$DB_TABLE" SOURCE_DB_RESULT_TABLE="$DB_RESULT_TABLE" \

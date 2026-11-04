@@ -10,7 +10,9 @@ windows work on every run.
 
 Database settings come from the same places rca-batch reads them:
 RCA_SETTINGS_FILE (settings.json env block) and the process environment,
-falling back to the local docker-compose defaults.
+falling back to the local docker-compose defaults. Because discovery may
+pick up settings pointing at a real database, the destructive seeding
+requires RCA_CI_SEED_CONFIRM=1 to run.
 
 Splunk, GitHub, and Jira are intentionally left unconfigured: the batch's
 steps 2 and 4 record a skip and continue.
@@ -26,6 +28,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -402,6 +405,16 @@ def write_logs(logs_dir: Path, run_date: datetime) -> None:
 
 
 def main() -> int:
+    if os.environ.get("RCA_CI_SEED_CONFIRM") != "1":
+        print(
+            "Refusing to seed: this script DROPs {SOURCE_DB_TABLE} and "
+            "{SOURCE_DB_RESULT_TABLE}, and its settings may be discovered from "
+            ".env / .claude settings pointing at a real database.\n"
+            "Set RCA_CI_SEED_CONFIRM=1 to confirm the target is disposable.",
+            file=sys.stderr,
+        )
+        return 1
+
     env = _settings()
     database = _database_settings(env)
     source_table = env.get("SOURCE_DB_TABLE") or "aap2_events"
