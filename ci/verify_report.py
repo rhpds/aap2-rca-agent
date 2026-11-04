@@ -25,9 +25,20 @@ def main() -> int:
     for job in report.get("failed_analyses", []):
         print(f"  failed job {job['job_id']} at {job['stage']}: {job['error'][:120]}")
 
-    assert requested >= 1, "no jobs were requested"
-    assert analyzed >= 1, "batch analyzed no jobs successfully"
+    # The seed set (ci/seed_test_db.py) is fixed and the pre-analysis gate is
+    # deterministic: 900002 folds into 900001 (same catalog, identical error)
+    # and 900004 into 900003 (cross-catalog, identical error), so exactly
+    # these three jobs are analyzed. Exact values catch regressions in the
+    # --since window, --limit, log staging and the dedup thresholds that a
+    # ">= 1" assertion would let through.
+    expected_analyzed = {"900001", "900003", "900005"}
+    assert requested == 3, f"expected 3 jobs sent for analysis, got {requested}"
+    assert analyzed == 3, f"expected 3 jobs analyzed, got {analyzed}"
     assert failed == 0, f"{failed} job(s) failed analysis"
+    analyzed_ids = {str(job["job_id"]) for job in report["job_summaries"] if job["status"] == "analyzed"}
+    assert analyzed_ids == expected_analyzed, (
+        f"expected {sorted(expected_analyzed)} analyzed, got {sorted(analyzed_ids)}"
+    )
     print("OK")
     return 0
 
