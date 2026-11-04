@@ -136,6 +136,8 @@ jobs:
           # re-fed to Helm, which creates the chart's own secret from them.
           LITELLM_URL=$(kubectl get secret "$LITELLM_SECRET" -n "$NS" -o jsonpath='{.data.ANTHROPIC_BASE_URL}' | base64 -d)
           LITELLM_KEY=$(kubectl get secret "$LITELLM_SECRET" -n "$NS" -o jsonpath='{.data.ANTHROPIC_API_KEY}' | base64 -d)
+          echo "::add-mask::$LITELLM_URL"
+          echo "::add-mask::$LITELLM_KEY"
           if [[ -z "$LITELLM_URL" || -z "$LITELLM_KEY" ]]; then
             echo "::error::$LITELLM_SECRET is missing ANTHROPIC_BASE_URL/ANTHROPIC_API_KEY" >&2
             exit 1
