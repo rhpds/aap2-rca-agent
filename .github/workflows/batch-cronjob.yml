@@ -36,7 +36,10 @@ jobs:
     # secrets) only execute when the safe-to-test label was just added.
     if: ${{ github.event_name != 'pull_request_target' || github.event.label.name == 'safe-to-test' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # WAIT_TIMEOUT_SECS alone allows 20 minutes for the batch; slow in-cluster
+    # image builds (full pip install) and rollouts can add 10+. A healthy but
+    # slow run must not be killed mid-batch.
+    timeout-minutes: 60
     steps:
       # In pull_request_target context the default checkout would use the PR's
       # base branch; explicitly check out the PR head so the PR's code is what
