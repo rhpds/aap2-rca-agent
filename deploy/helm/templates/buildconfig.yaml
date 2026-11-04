@@ -1,4 +1,4 @@
-{{- if .Values.buildconfig.enabled }}
+{{- if ne (dig "buildconfig" "enabled" true .Values.AsMap) false }}
 apiVersion: build.openshift.io/v1
 kind: BuildConfig
 metadata:
