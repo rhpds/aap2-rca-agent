@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# One-time setup of a namespace for the batch CI workflows
-# (batch-openshift.yml / batch-cronjob.yml).
+# One-time setup of a namespace for the batch CI workflow
+# (batch-cronjob.yml).
 #
 # Creates only what the workflows don't create themselves:
 #   1. claude-litellm-creds secret (skipped if it already exists)
 #   2. long-lived token for the rca-ci-runner service account (the SA and
 #      its rolebinding are expected to already exist — see --sa-namespace)
-#   3. kubeconfig for the SA (default ~/.kube/rca-ci-runner.kubeconfig —
-#      the path ci/run-local.sh reads)
+#   3. kubeconfig for the SA (default ~/.kube/rca-ci-runner.kubeconfig)
 #   4. the rca-ci-jumpbox image (the only image push/PR runs never rebuild)
 #   5. GitHub-side: KUBECONFIG_B64 secret + safe-to-test label (optional)
 #
@@ -29,12 +28,11 @@ cd "$(dirname "$0")/.."
 set -a; . ci/ci.env; set +a
 
 usage() {
-  sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 }
 
 NS=""
-ROLE="edit"
 KUBECONFIG_OUT="$HOME/.kube/rca-ci-runner.kubeconfig"
 REPO=""
 SKIP_GITHUB=0
@@ -45,7 +43,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --litellm-url) LITELLM_URL="${2:?}"; shift 2 ;;
     --litellm-key) LITELLM_KEY="${2:?}"; shift 2 ;;
-    --role) ROLE="${2:?}"; shift 2 ;;
     --sa-namespace) SA_NS="${2:?}"; shift 2 ;;
     --kubeconfig) KUBECONFIG_OUT="${2:?}"; shift 2 ;;
     --repo) REPO="${2:?}"; shift 2 ;;
@@ -60,7 +57,6 @@ done
 # The rca-ci-runner SA may live in a different namespace than the CI target
 # (e.g. an SA in rh-ace-aiops with rights in both rh-ace-aiops and the test ns).
 SA_NS="${SA_NS:-$NS}"
-[[ "$ROLE" == edit || "$ROLE" == admin ]] || { echo "--role must be edit or admin" >&2; exit 2; }
 
 for tool in oc kubectl; do
   command -v "$tool" >/dev/null || { echo "error: $tool not found" >&2; exit 1; }
@@ -70,28 +66,9 @@ echo "==> Checking namespace $NS"
 kubectl get namespace "$NS" >/dev/null \
   || { echo "error: namespace $NS does not exist — create it first (oc new-project $NS)" >&2; exit 1; }
 
-# # add-role-to-user is the one operation plain 'edit' cannot perform; fail
-# # with an actionable message up front instead of half-provisioning.
-# if ! kubectl auth can-i create rolebindings -n "$NS" >/dev/null 2>&1; then
-#   echo "error: you cannot create rolebindings in $NS." >&2
-#   echo "       Ask a cluster admin to run, or use a cluster where you have admin:" >&2
-#   echo "       oc adm policy add-role-to-user $ROLE -z rca-ci-runner -n $NS" >&2
-#   exit 1
-# fi
-
-# echo "==> Service account rca-ci-runner (role: $ROLE)"
-# kubectl get sa rca-ci-runner -n "$NS" >/dev/null 2>&1 || kubectl create sa rca-ci-runner -n "$NS"
-# oc adm policy add-role-to-user "$ROLE" -z rca-ci-runner -n "$NS"
-# kubectl apply -n "$NS" -f - <<'EOF'
-# apiVersion: v1
-# kind: Secret
-# type: kubernetes.io/service-account-token
-# metadata:
-#   name: rca-ci-runner-token
-#   annotations:
-#     kubernetes.io/service-account.name: rca-ci-runner
-# EOF
-
+# The SA and its rolebinding must already exist (a cluster admin creates them:
+# oc create sa rca-ci-runner -n $SA_NS; oc adm policy add-role-to-user edit
+# -z rca-ci-runner -n $NS). This script only mints the token secret for it.
 echo "==> Service account rca-ci-runner in $SA_NS (token for CI)"
 kubectl apply -n "$SA_NS" -f - <<'EOF'
 apiVersion: v1
@@ -176,7 +153,7 @@ else
     REPO=$(git remote get-url origin | sed 's|.*github.com[:/]||; s|\.git$||')
   fi
   echo "==> GitHub secret KUBECONFIG_B64 on $REPO"
-  base64 -w0 "$KUBECONFIG_OUT" | env -u GITHUB_TOKEN gh secret set KUBECONFIG_B64 -R "$REPO"
+  base64 < "$KUBECONFIG_OUT" | tr -d '\n' | env -u GITHUB_TOKEN gh secret set KUBECONFIG_B64 -R "$REPO"
   echo "==> GitHub label safe-to-test"
   env -u GITHUB_TOKEN gh label create safe-to-test -R "$REPO" \
     --description "Run batch CI workflows on this PR (maintainer vouch)" --color 0E8A16 2>/dev/null \
@@ -186,8 +163,6 @@ fi
 echo
 echo "Done. Namespace $NS is ready for the batch CI workflows."
 echo "Notes:"
-echo "  - ci/run-local.sh assumes the rh-ace-aiops-test namespace; adjust NS/"
-echo "    image refs there if targeting a different one."
 echo "  - The main rhdp-rca-plugin image is built by the workflows themselves"
 echo "    on the first push/PR run."
 echo "  - Trigger the first run: git commit --allow-empty -m 'ci: bootstrap' && git push"
