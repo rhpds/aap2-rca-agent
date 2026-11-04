@@ -233,13 +233,15 @@ def build_document(spec: dict, job_index: int, run_date: datetime) -> dict:
         )
     )
     idx += 1
-    # Some ordinary successful tasks
+    # Some ordinary successful tasks. Offsets are fractions of the job window
+    # (like the retries below) so the terminal failure stays last even for
+    # short jobs.
     for n in range(12):
         events.append(
             _event(
                 idx,
                 "runner_on_ok",
-                started + timedelta(seconds=120 + n * 30),
+                started + timedelta(seconds=spec["duration"] * (0.30 + 0.40 * n / 11)),
                 task=f"Routine setup task {n}",
                 play=ft["play"],
                 role=ROLE_NAMES[n % len(ROLE_NAMES)],
@@ -253,7 +255,7 @@ def build_document(spec: dict, job_index: int, run_date: datetime) -> dict:
             _event(
                 idx,
                 "runner_retry",
-                started + timedelta(seconds=300 + n * 60),
+                started + timedelta(seconds=spec["duration"] * (0.72 + 0.05 * n)),
                 task=ft["task"],
                 play=ft["play"],
                 role=ft["role"],
