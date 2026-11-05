@@ -1,0 +1,46 @@
+# Test variant of application.yaml: points at a fork branch and a test
+# namespace instead of rhpds/main and rh-ace-aiops. Keep uncommitted (or out
+# of any PR); the original application.yaml stays the source of truth for the
+# prod deployment.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: rhdp-rca
+  namespace: openshift-gitops
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/yyualvin/aap2-rca-agent.git
+    targetRevision: argocd
+    path: deploy/helm
+    helm:
+      # Must match the legacy helm release name so rendered resource names
+      # (rhdp-rca-batch, rhdp-rca-pvc, ...) adopt the existing resources.
+      releaseName: rhdp-rca
+      valueFiles:
+        - values-gitops.yaml
+      # Test overrides. ArgoCD renders values-gitops.yaml from the remote
+      # branch, so these parameters point the BuildConfig at the fork and drop
+      # the prod-cluster image digest and storage class so the deployment uses
+      # the locally built :latest image and the cluster's default storage.
+      parameters:
+        - name: git.uri
+          value: https://github.com/yyualvin/aap2-rca-agent.git
+        - name: git.ref
+          value: argocd
+        - name: image.digest
+          value: ""
+        - name: pvc.storageClassName
+          value: ""
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd-test3
+  # Manual sync: ArgoCD reports drift but applies nothing until synced
+  # deliberately. Enable automation later by adding an `automated` block here.
+  syncPolicy: {}
+  ignoreDifferences:
+    - group: ""
+      kind: Secret
+      jsonPointers:
+        - /data
+        - /stringData

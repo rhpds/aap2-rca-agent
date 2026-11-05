@@ -8,6 +8,9 @@ metadata:
     {{- include "rhdp-rca.labels" . | nindent 4 }}
 spec:
   schedule: {{ .Values.cronjob.schedule | quote }}
+  {{- if .Values.cronjob.suspend }}
+  suspend: true
+  {{- end }}
   successfulJobsHistoryLimit: {{ .Values.cronjob.successfulJobsHistoryLimit }}
   failedJobsHistoryLimit: {{ .Values.cronjob.failedJobsHistoryLimit }}
   concurrencyPolicy: Forbid

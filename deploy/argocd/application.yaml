@@ -1,0 +1,29 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: rhdp-rca
+  namespace: openshift-gitops
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/rhpds/aap2-rca-agent.git
+    targetRevision: main
+    path: deploy/helm
+    helm:
+      # Must match the legacy helm release name so rendered resource names
+      # (rhdp-rca-batch, rhdp-rca-pvc, ...) adopt the existing resources.
+      releaseName: rhdp-rca
+      valueFiles:
+        - values-gitops.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: rh-ace-aiops
+  # Manual sync: ArgoCD reports drift but applies nothing until synced
+  # deliberately. Enable automation later by adding an `automated` block here.
+  syncPolicy: {}
+  ignoreDifferences:
+    - group: ""
+      kind: Secret
+      jsonPointers:
+        - /data
+        - /stringData
