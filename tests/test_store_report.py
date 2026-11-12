@@ -128,14 +128,49 @@ def test_store_report_persists_standalone_result_columns() -> None:
     for column in (
         "root_cause_category",
         "confidence",
+        "task_name",
+        "task_signature",
         "related_result_id",
         "related_result_confidence",
     ):
         assert column in insert_sql
     assert insert_call.args[1][3] == "infrastructure"
     assert insert_call.args[1][5] == "high"
-    assert insert_call.args[1][8] == 42
-    assert insert_call.args[1][9] == "medium"
+    assert insert_call.args[1][10] == 42
+    assert insert_call.args[1][11] == "medium"
+
+
+def test_store_report_persists_task_signature_jsonb() -> None:
+    connection, cursor = _connection_and_cursor()
+    cursor.fetchone.return_value = {"id": 55}
+    task_signature = {
+        "play": "Setup",
+        "role": "common",
+        "task": "Install dependencies",
+        "task_action": "yum",
+        "task_path": "/roles/common/tasks/main.yml",
+        "error_message": "Package not found",
+    }
+
+    assert store_report.store_report(
+        connection,
+        {"results_table": "results", "source_table": "events"},
+        {
+            "batch_id": "batch_test",
+            "job_summaries": [
+                {
+                    "job_id": "123",
+                    "status": "analyzed",
+                    "task_signature": task_signature,
+                }
+            ],
+        },
+    )
+
+    insert_call = cursor.execute.call_args_list[0]
+    assert "task_signature" in str(insert_call.args[0])
+    assert insert_call.args[1][8] == "Install dependencies"
+    assert insert_call.args[1][9].adapted == task_signature
 
 
 def test_link_intra_batch_dupes_reads_mapping_result_row() -> None:

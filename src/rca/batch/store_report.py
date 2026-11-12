@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from rca.config import load_database_config
 from rca.database import connect_db
 from rca.batch.match import Confidence, MatchSignals, score_similarity, weakest_confidence
+from rca.batch.task_signature import task_signature_data
 from rca.models import RootCauseDetail
 from rca.models.base import format_validation_errors
 
@@ -179,13 +180,18 @@ def store_report(
             root_cause = build_root_cause(job, jid)
             recommendation = root_cause.get("recommendations", [])
             related_result_id, related_result_confidence = _relationship_values(job)
+            task_signature = task_signature_data(job.get("task_signature"))
+            task_name = job.get("task_name") or (
+                task_signature.get("task") if task_signature is not None else None
+            )
             cur.execute(
                 psycopg2.sql.SQL(
                     """INSERT INTO {} AS result
                        (batch_id, job_id, status, root_cause_category, root_cause,
                         confidence, catalog_item, job_duration_seconds,
-                        related_result_id, related_result_confidence, recommendation)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        task_name, task_signature, related_result_id,
+                        related_result_confidence, recommendation)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                        ON CONFLICT (batch_id, job_id) DO UPDATE SET
                            status = EXCLUDED.status,
                            root_cause_category = EXCLUDED.root_cause_category,
@@ -193,6 +199,9 @@ def store_report(
                            confidence = EXCLUDED.confidence,
                            catalog_item = EXCLUDED.catalog_item,
                            job_duration_seconds = EXCLUDED.job_duration_seconds,
+                           task_name = COALESCE(EXCLUDED.task_name, result.task_name),
+                           task_signature =
+                               COALESCE(EXCLUDED.task_signature, result.task_signature),
                            related_result_id =
                                COALESCE(EXCLUDED.related_result_id, result.related_result_id),
                            related_result_confidence =
@@ -211,6 +220,8 @@ def store_report(
                     job.get("confidence"),
                     job.get("catalog_item"),
                     job.get("job_duration_seconds"),
+                    task_name,
+                    psycopg2.extras.Json(task_signature) if task_signature is not None else None,
                     related_result_id,
                     related_result_confidence,
                     psycopg2.extras.Json(recommendation),

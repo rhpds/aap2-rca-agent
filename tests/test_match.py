@@ -60,6 +60,43 @@ def test_pre_analysis_signature_mismatch_falls_back_to_shared_signals() -> None:
     )
 
     assert result.confidence == "high"
+    assert any(item["source"] == "shared_scorer" for item in result.evidence)
+
+
+def test_pre_analysis_low_signature_error_similarity_falls_back() -> None:
+    left_signature = TaskSignature(
+        play="Setup",
+        role="common",
+        task="Install dependencies",
+        task_action="yum",
+        task_path="/roles/common/tasks/main.yml",
+        error_message="Package repository unavailable",
+    )
+    right_signature = TaskSignature(
+        play="Setup",
+        role="common",
+        task="Install dependencies",
+        task_action="yum",
+        task_path="/roles/common/tasks/main.yml",
+        error_message="GPG signature validation failed",
+    )
+
+    result = score_similarity(
+        MatchSignals(
+            catalog_item="widget",
+            text="Database connection refused repeatedly",
+            task_signature=left_signature,
+        ),
+        MatchSignals(
+            catalog_item="widget",
+            text="Database connection refused repeatedly",
+            task_signature=right_signature,
+        ),
+        "pre_analysis",
+    )
+
+    assert result.confidence == "high"
+    assert any(item["source"] == "shared_scorer" for item in result.evidence)
 
 
 def test_post_analysis_semantic_judgment_is_bounded_by_category() -> None:

@@ -14,6 +14,8 @@ CREATE TABLE aap2_job_results (
     confidence                     TEXT,
     catalog_item                   TEXT,
     job_duration_seconds           INTEGER,
+    task_name                      TEXT,
+    task_signature                 JSONB,
 
     -- { summary, platform, failing_role, failing_github_path, analysis_path,
     --   evidence[], causal_chain[], misidentifications[], recommendations[] }
@@ -49,6 +51,8 @@ CREATE INDEX aap2_job_results_related_result_id_idx
 --
 --   root_cause_summary             -> root_cause->>'summary'
 --   root_cause                     NEW  JSONB, all render-only detail
+--   task_name                      NEW  TEXT, normalized failed-task lookup name
+--   task_signature                 NEW  JSONB, normalized failed-task identity
 --   ticket_key                     NEW  short Jira key alongside the URL
 --   created_at                     NEW  removes parsing timestamps out of batch_id
 --   UNIQUE (batch_id, job_id)      NEW  constraint the ON CONFLICT assumes exists
@@ -72,6 +76,8 @@ CREATE INDEX aap2_job_results_related_result_id_idx
 --
 -- ALTER TABLE aap2_job_results ADD COLUMN IF NOT EXISTS root_cause JSONB;
 -- ALTER TABLE aap2_job_results ADD COLUMN IF NOT EXISTS recommendation JSONB;
+-- ALTER TABLE aap2_job_results ADD COLUMN IF NOT EXISTS task_name TEXT;
+-- ALTER TABLE aap2_job_results ADD COLUMN IF NOT EXISTS task_signature JSONB;
 -- ALTER TABLE aap2_job_results
 --     ADD COLUMN IF NOT EXISTS related_result_id
 --         INTEGER REFERENCES aap2_job_results(id);

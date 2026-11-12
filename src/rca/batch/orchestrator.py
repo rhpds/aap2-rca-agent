@@ -45,7 +45,11 @@ from rca.batch.pre_filter_jobs import (
     pre_matched_entries,
     pre_analysis_gate,
 )
-from rca.batch.task_signature import build_task_signature
+from rca.batch.task_signature import (
+    build_task_signature,
+    deserialize_task_signature,
+    task_signature_data,
+)
 from rca.batch.query_source_db import query_job_ids
 from rca.batch.store_report import (
     link_intra_batch_dupes,
@@ -219,6 +223,7 @@ def _load_pre_analysis_contexts(
             failed_outcomes.append((job_id, exc))
             continue
         if path is None or context is None:
+            logger.debug("Task context for job %s was unavailable", job_id)
             continue
         contexts[job_id] = context
         job_log_paths[job_id] = path
@@ -238,9 +243,13 @@ def _load_pre_analysis_contexts(
 def _attach_historical_task_signatures(
     results: list[dict[str, Any]], config: Config
 ) -> None:
-    """Attach local task signatures to recent results without changing schemas."""
+    """Attach persisted signatures, falling back to local result artifacts."""
 
     for result in results:
+        signature = deserialize_task_signature(result.get("task_signature"))
+        if signature is not None:
+            result["task_signature"] = signature
+            continue
         context = None
         analysis_path = result.get("analysis_path")
         if analysis_path:
@@ -967,7 +976,7 @@ def _category(value: Any) -> str:
 def _job_summary(execution: JobExecution) -> dict[str, Any]:
     if execution.status != "completed" or execution.summary is None:
         error = execution.error or "Analysis failed"
-        return {
+        summary = {
             "job_id": execution.job_id,
             "status": "failed",
             "root_cause_category": "unknown",
@@ -975,6 +984,12 @@ def _job_summary(execution: JobExecution) -> dict[str, Any]:
             "confidence": "low",
             "analysis_duration_ms": execution.duration_ms,
         }
+        context = execution.artifacts.job_context if execution.artifacts else {}
+        task_signature = task_signature_data(build_task_signature(context))
+        if task_signature is not None:
+            summary["task_signature"] = task_signature
+            summary["task_name"] = task_signature["task"]
+        return summary
 
     data = execution.summary
     root_cause = data.get("root_cause") or {}
@@ -991,6 +1006,10 @@ def _job_summary(execution: JobExecution) -> dict[str, Any]:
         "analysis_path": str(artifacts.analysis_dir) if artifacts else "",
         "historical_matches": [],
     }
+    task_signature = task_signature_data(build_task_signature(context))
+    if task_signature is not None:
+        summary["task_signature"] = task_signature
+        summary["task_name"] = task_signature["task"]
     job_name = context.get("job_name") or ""
     # The legacy batch report includes catalog_item where it can be parsed from
     # the AAP job name; keep it optional for logs with other naming schemes.
@@ -1525,27 +1544,22 @@ def run_batch(
                 logger.warning("Could not load pre-filter history; continuing with dedup only: %s", exc)
         _attach_historical_task_signatures(recent_results, config)
 
-        try:
-            _baseline_analyze_ids, baseline_skip_targets, _baseline_dupes = pre_analysis_gate(
-                job_ids,
-                metadata,
-                recent_results,
-                use_history=not no_pre_filter,
-            )
-        except (ValueError, KeyError, TypeError) as exc:
-            logger.warning("Baseline pre-analysis gate failed; analyzing all jobs: %s", exc)
-            _baseline_analyze_ids, baseline_skip_targets = list(job_ids), {}
-
-        context_job_ids = [
-            job_id for job_id in job_ids if job_id not in baseline_skip_targets
-        ]
         logger.info(
-            "[STEP 1a] Fetching task contexts for %d unresolved job(s)",
-            len(context_job_ids),
+            "[STEP 1a] Fetching task contexts for %d job(s)",
+            len(job_ids),
         )
         task_contexts, job_log_paths = _load_pre_analysis_contexts(
-            context_job_ids, config, pool
+            job_ids, config, pool
         )
+        missing_context_ids = [
+            job_id for job_id in job_ids if job_id not in task_contexts
+        ]
+        if missing_context_ids:
+            logger.warning(
+                "Pre-analysis task signatures are unavailable for jobs %s; "
+                "using fallback signals for those jobs",
+                ", ".join(map(str, missing_context_ids)),
+            )
 
         try:
             analyze_ids, skip_targets, dupes = pre_analysis_gate(

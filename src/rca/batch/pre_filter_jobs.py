@@ -15,7 +15,12 @@ import psycopg2.sql
 from rca.config import load_database_config
 from rca.database import connect_db, known_issue_active_sql
 from rca.batch.match import MatchSignals, score_similarity
-from rca.batch.task_signature import TaskSignature, build_task_signature
+from rca.batch.task_signature import (
+    TaskSignature,
+    build_task_signature,
+    deserialize_task_signature,
+    normalize_task_name,
+)
 
 
 
@@ -35,6 +40,14 @@ def extract_catalog_item(job_name: str) -> str | None:
     return None
 
 
+def _same_task_name(left: str | None, right: str | None) -> bool:
+    """Treat an unavailable task name as compatible for fallback matching."""
+
+    left_key = normalize_task_name(left)
+    right_key = normalize_task_name(right)
+    return not left_key or not right_key or left_key == right_key
+
+
 def fetch_recent_results(
     conn: Any,
     results_table: str,
@@ -52,6 +65,8 @@ def fetch_recent_results(
                 """SELECT r.id, r.job_id, r.catalog_item, r.root_cause_category,
                           r.root_cause->>'summary' AS root_cause_summary,
                           r.root_cause->>'analysis_path' AS analysis_path,
+                          r.task_name,
+                          r.task_signature,
                           COALESCE(r.related_result_id, r.id) AS canonical_result_id,
                           e.error_message
                    FROM {results} r
@@ -85,6 +100,7 @@ def _job_signal(
     return MatchSignals(
         catalog_item=catalog_item,
         text=text,
+        task_name=signature.task if signature else None,
         task_signature=signature,
     )
 
@@ -95,6 +111,8 @@ def _historical_signal(result: dict[str, Any]) -> MatchSignals:
         catalog_item=result.get("catalog_item"),
         text=result.get("error_message")
         or (signature.error_message if isinstance(signature, TaskSignature) else None),
+        task_name=result.get("task_name")
+        or (signature.task if isinstance(signature, TaskSignature) else None),
         category=result.get("root_cause_category"),
         task_signature=signature if isinstance(signature, TaskSignature) else None,
     )
@@ -189,9 +207,15 @@ def pre_analysis_gate(
                 continue
             if representative_signal is None:
                 continue
+            historical_signal = _historical_signal(historical_result)
+            if not _same_task_name(
+                representative_signal.task_name,
+                historical_signal.task_name,
+            ):
+                continue
             result = score_similarity(
                 representative_signal,
-                _historical_signal(historical_result),
+                historical_signal,
                 "pre_analysis",
             )
             if result.confidence != "high" or result.score < best_score:
@@ -330,6 +354,12 @@ def main(argv: list[str] | None = None) -> int:
                 config["source_table"],
                 args.lookback_hours,
             )
+            for recent_result in recent_results:
+                signature = deserialize_task_signature(
+                    recent_result.get("task_signature")
+                )
+                if signature is not None:
+                    recent_result["task_signature"] = signature
             job_metadata = fetch_job_metadata(
                 conn,
                 config["source_table"],

@@ -455,10 +455,10 @@ def main() -> int:
         confidence TEXT,
         catalog_item TEXT,
         job_duration_seconds INTEGER,
+        task_name TEXT,
+        task_signature JSONB,
         ticket_link TEXT,
         ticket_resolve_datetime_gmt TIMESTAMPTZ,
-        task_signature JSONB NULL,
-        task_name TEXT NULL,
         CONSTRAINT results_batch_job_unique UNIQUE (batch_id, job_id)
     );
 

@@ -1,6 +1,10 @@
 """Tests for normalized pre-analysis task signatures."""
 
-from rca.batch.task_signature import build_task_signature
+from rca.batch.task_signature import (
+    build_task_signature,
+    deserialize_task_signature,
+    task_signature_data,
+)
 
 
 def _failed_task(**overrides: object) -> dict[str, object]:
@@ -67,6 +71,13 @@ def test_play_level_task_without_role_is_complete() -> None:
     assert signature.is_complete
 
 
+def test_task_signature_without_task_path_is_complete() -> None:
+    signature = build_task_signature({"failed_tasks": [_failed_task(task_path="")]})
+
+    assert signature is not None
+    assert signature.is_complete
+
+
 def test_task_signature_ignores_task_path_line_numbers() -> None:
     first = build_task_signature(
         {"failed_tasks": [_failed_task(task_path="/roles/common/tasks/main.yml:10")]}
@@ -78,6 +89,23 @@ def test_task_signature_ignores_task_path_line_numbers() -> None:
     assert first is not None
     assert second is not None
     assert first.identity_key == second.identity_key
+
+
+def test_task_signature_round_trips_through_jsonb_data() -> None:
+    signature = build_task_signature({"failed_tasks": [_failed_task()]})
+
+    assert signature is not None
+    data = task_signature_data(signature)
+    assert data == {
+        "play": "Setup",
+        "role": "common",
+        "task": "Install dependencies",
+        "task_action": "yum",
+        "task_path": "/roles/common/tasks/main.yml",
+        "error_message": "Package not found",
+    }
+    assert deserialize_task_signature(data) == signature
+    assert deserialize_task_signature("Package not found") is None
 
 
 def test_incomplete_task_signature_is_reported_as_incomplete() -> None:

@@ -2,7 +2,9 @@
 
 import json
 from io import StringIO
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
+
+import psycopg2.sql
 
 from rca.batch import pre_filter_jobs
 from rca.batch.task_signature import TaskSignature
@@ -69,6 +71,26 @@ def test_job_signal_accepts_a_signature_without_job_metadata() -> None:
     assert signal.catalog_item is None
     assert signal.text == "Connection reset by peer"
     assert signal.task_signature == _signature()
+
+
+def test_fetch_recent_results_selects_persisted_task_signature(
+    monkeypatch,
+) -> None:
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchall.return_value = []
+    monkeypatch.setattr(
+        pre_filter_jobs,
+        "known_issue_active_sql",
+        Mock(return_value=psycopg2.sql.SQL("TRUE")),
+    )
+
+    pre_filter_jobs.fetch_recent_results(connection, "results", "events")
+
+    query = str(cursor.execute.call_args.args[0])
+    assert "r.task_name" in query
+    assert "r.task_signature" in query
+
 
 def test_pre_analysis_gate_clusters_duplicates_and_preserves_ambiguity_guard() -> None:
     job_metadata = {
@@ -239,6 +261,34 @@ def test_pre_analysis_gate_uses_task_signature_for_known_issue_matching() -> Non
     assert dupes == []
 
 
+def test_pre_analysis_gate_rejects_historical_match_with_different_task_name() -> None:
+    job_metadata = {20: {"job_name": "RHPDS platform.other.dev-20-create"}}
+    task_contexts = {20: {"failed_tasks": [_signature().__dict__]}}
+    historical = [
+        {
+            "id": 90,
+            "job_id": 10,
+            "catalog_item": "widget",
+            "root_cause_category": "infrastructure",
+            "canonical_result_id": 90,
+            "task_name": "Remove dependencies",
+            "error_message": "Connection reset by peer",
+            "task_signature": _signature(),
+        }
+    ]
+
+    analyze_ids, skip_targets, dupes = pre_filter_jobs.pre_analysis_gate(
+        [20],
+        job_metadata,
+        historical,
+        task_contexts=task_contexts,
+    )
+
+    assert analyze_ids == [20]
+    assert skip_targets == {}
+    assert dupes == []
+
+
 def test_pre_analysis_gate_rejects_ambiguous_task_signature_history() -> None:
     job_metadata = {20: {"job_name": "RHPDS platform.widget.dev-20-create"}}
     task_contexts = {20: {"failed_tasks": [_signature().__dict__]}}
@@ -289,6 +339,7 @@ def test_main_delegates_known_issue_filter_to_shared_helper(monkeypatch, capsys)
             "catalog_item": "widget",
             "root_cause_category": "infrastructure",
             "root_cause_summary": "Repeated connection reset",
+            "task_signature": _signature().__dict__,
         }
     ]
     job_metadata = {
@@ -333,6 +384,7 @@ def test_main_delegates_known_issue_filter_to_shared_helper(monkeypatch, capsys)
     fetch_recent_results.assert_called_once_with(connection, "results", "events", 8)
     fetch_job_metadata.assert_called_once_with(connection, "events", job_ids)
     pre_analysis_gate.assert_called_once_with(job_ids, job_metadata, recent_results)
+    assert recent_results[0]["task_signature"] == _signature()
     connection.close.assert_called_once_with()
     assert json.loads(capsys.readouterr().out) == expected
 

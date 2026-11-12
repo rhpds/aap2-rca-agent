@@ -109,6 +109,42 @@ def test_store_report_upserts_on_conflict(db) -> None:
     assert count == 1
 
 
+def test_store_report_persists_task_signature_jsonb(db) -> None:
+    _insert_source_job(db, 23)
+    task_signature = {
+        "play": "Setup",
+        "role": "common",
+        "task": "Install dependencies",
+        "task_action": "yum",
+        "task_path": "/roles/common/tasks/main.yml",
+        "error_message": "Package not found",
+    }
+    report = {
+        "batch_id": "batch_test_task_signature",
+        "job_summaries": [
+            {
+                "job_id": "23",
+                "status": "analyzed",
+                "confidence": "high",
+                "task_signature": task_signature,
+            }
+        ],
+    }
+
+    assert store_report(db, _config(), report) is True
+
+    with db.cursor() as cur:
+        cur.execute(
+            f"SELECT task_name, task_signature FROM {RESULTS_TABLE}"
+            " WHERE batch_id = %s AND job_id = %s",
+            ("batch_test_task_signature", 23),
+        )
+        stored_task_name, stored_signature = cur.fetchone()
+
+    assert stored_task_name == "Install dependencies"
+    assert stored_signature == task_signature
+
+
 def test_post_analysis_link_persists_related_result(db) -> None:
     for job_id in (31, 32):
         _insert_source_job(db, job_id)

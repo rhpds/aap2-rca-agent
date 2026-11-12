@@ -196,6 +196,73 @@ def test_historical_task_signatures_load_from_saved_analysis_artifacts(
     )
 
 
+def test_historical_task_signatures_prefer_persisted_jsonb(
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    results = [
+        {
+            "id": 77,
+            "job_id": 77,
+            "task_signature": {
+                "play": "Setup",
+                "role": "common",
+                "task": "Install dependencies",
+                "task_action": "yum",
+                "task_path": "/roles/common/tasks/main.yml",
+                "error_message": "Package not found",
+            },
+        }
+    ]
+
+    orchestrator._attach_historical_task_signatures(results, config)
+
+    assert results[0]["task_signature"].identity_key == (
+        "setup",
+        "common",
+        "install dependencies",
+        "yum",
+        "/roles/common/tasks/main.yml",
+    )
+
+
+def test_pre_analysis_context_load_failure_is_debug_logged_with_job_id(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    pool = object()
+
+    def fake_resolve_job_log(
+        *,
+        config: orchestrator.Config,
+        job_id: str | None,
+        job_log: str | None,
+        fetch: bool,
+        db_pool: object | None,
+    ) -> tuple[Path, str | None]:
+        raise orchestrator.AnalysisPipelineError("remote log unavailable")
+
+    monkeypatch.setattr(
+        "rca.analysis.pipeline._resolve_job_log", fake_resolve_job_log
+    )
+
+    caplog.set_level(logging.DEBUG, logger="rca.batch")
+    contexts, job_log_paths = orchestrator._load_pre_analysis_contexts(
+        [101], config, pool
+    )
+
+    assert contexts == {}
+    assert job_log_paths == {}
+    record = next(
+        record
+        for record in caplog.records
+        if record.levelname == "DEBUG" and "job 101" in record.getMessage().casefold()
+    )
+    assert "remote log unavailable" in record.getMessage()
+
+
 def test_historical_task_signatures_fall_back_to_local_job_logs(
     tmp_path: Path,
 ) -> None:
@@ -818,6 +885,42 @@ def test_legacy_skill_categories_survive_report_aggregation(category: str, expec
     assert orchestrator._recommendations([summary])[0]["category"] == expected
 
 
+def test_job_summary_includes_task_signature(tmp_path: Path) -> None:
+    execution = orchestrator.JobExecution(
+        "101",
+        "completed",
+        1,
+        artifacts=SimpleNamespace(
+            job_context={
+                "failed_tasks": [
+                    {
+                        "play": "Setup",
+                        "role": "common",
+                        "task": "Install dependencies",
+                        "task_action": "yum",
+                        "task_path": "/roles/common/tasks/main.yml",
+                        "error_message": "Package not found",
+                    }
+                ]
+            },
+            analysis_dir=tmp_path,
+        ),
+        summary={"root_cause": {"summary": "test", "category": "configuration"}},
+    )
+
+    summary = orchestrator._job_summary(execution)
+
+    assert summary["task_name"] == "Install dependencies"
+    assert summary["task_signature"] == {
+        "play": "Setup",
+        "role": "common",
+        "task": "Install dependencies",
+        "task_action": "yum",
+        "task_path": "/roles/common/tasks/main.yml",
+        "error_message": "Package not found",
+    }
+
+
 @pytest.mark.parametrize(
     ("statuses", "has_pre_match", "expected_exit"),
     [
@@ -941,7 +1044,7 @@ def test_failed_representative_falls_back_to_next_duplicate(
     assert updated_dupes == [{"job_id": 102, "representative_job_id": 101}]
 
 
-def test_pre_analysis_fetches_contexts_only_for_unresolved_jobs(
+def test_pre_analysis_fetches_task_contexts_for_all_jobs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -961,6 +1064,7 @@ def test_pre_analysis_fetches_contexts_only_for_unresolved_jobs(
         }
     ]
     context = {"failed_tasks": [{"task": "Install dependencies"}]}
+    contexts = {job_id: context for job_id in (10, 11, 12)}
     log_path = tmp_path / "job_10.json"
     gate_task_contexts = []
 
@@ -973,8 +1077,6 @@ def test_pre_analysis_fetches_contexts_only_for_unresolved_jobs(
         task_contexts: dict[int, dict[str, object]] | None = None,
     ) -> tuple[list[int], dict[int, int], list[dict[str, object]]]:
         gate_task_contexts.append(task_contexts)
-        if task_contexts is None:
-            return [10], {11: 90, 12: 90}, []
         return [], {11: 90, 12: 90}, []
 
     monkeypatch.setattr(orchestrator, "pooled_connection", lambda pool: nullcontext(Mock()))
@@ -984,7 +1086,7 @@ def test_pre_analysis_fetches_contexts_only_for_unresolved_jobs(
     monkeypatch.setattr(orchestrator, "fetch_known_issues", Mock(return_value=[]))
     monkeypatch.setattr(orchestrator, "_attach_historical_task_signatures", Mock())
     monkeypatch.setattr(orchestrator, "pre_analysis_gate", fake_pre_analysis_gate)
-    context_loader = Mock(return_value=({10: context}, {10: log_path}))
+    context_loader = Mock(return_value=(contexts, {10: log_path}))
     monkeypatch.setattr(orchestrator, "_load_pre_analysis_contexts", context_loader)
     monkeypatch.setattr(orchestrator, "store_pre_matched", Mock())
     analyze_jobs = Mock()
@@ -992,9 +1094,56 @@ def test_pre_analysis_fetches_contexts_only_for_unresolved_jobs(
 
     assert orchestrator.run_batch(config, pool=pool, cwd=tmp_path) == 0
 
-    assert gate_task_contexts == [None, {10: context}]
-    assert context_loader.call_args.args == ([10], config, pool)
+    assert gate_task_contexts == [contexts]
+    assert context_loader.call_args.args == ([10, 11, 12], config, pool)
     analyze_jobs.assert_not_called()
+
+
+def test_pre_analysis_reports_jobs_without_task_contexts(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    pool = object()
+    metadata = {
+        10: {"job_name": "RHPDS platform.widget.dev-10-create"},
+        11: {"job_name": "RHPDS platform.widget.dev-11-create"},
+    }
+    context = {"failed_tasks": [{"task": "Install dependencies"}]}
+
+    monkeypatch.setattr(orchestrator, "pooled_connection", lambda pool: nullcontext(Mock()))
+    monkeypatch.setattr(orchestrator, "query_job_ids", Mock(return_value=[10, 11]))
+    monkeypatch.setattr(orchestrator, "fetch_job_metadata", Mock(return_value=metadata))
+    monkeypatch.setattr(orchestrator, "fetch_recent_results", Mock(return_value=[]))
+    monkeypatch.setattr(orchestrator, "fetch_known_issues", Mock(return_value=[]))
+    monkeypatch.setattr(orchestrator, "_attach_historical_task_signatures", Mock())
+    monkeypatch.setattr(
+        orchestrator,
+        "pre_analysis_gate",
+        Mock(return_value=([10, 11], {}, [])),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_load_pre_analysis_contexts",
+        Mock(return_value=({10: context}, {})),
+    )
+    monkeypatch.setattr(orchestrator, "store_pre_matched", Mock())
+    execution = orchestrator.JobExecution(
+        "10",
+        "completed",
+        1,
+        summary={"root_cause": {"summary": "test", "category": "unknown"}},
+    )
+    monkeypatch.setattr(orchestrator, "_analyze_jobs", AsyncMock(return_value=[execution]))
+    monkeypatch.setattr(orchestrator, "ensure_jumpbox_alias", Mock())
+    monkeypatch.setattr(orchestrator, "_store_batch_report", Mock(return_value=True))
+    caplog.set_level(logging.WARNING, logger="rca.batch")
+
+    assert orchestrator.run_batch(config, pool=pool, cwd=tmp_path) == 0
+
+    assert "jobs 11" in caplog.text
+    assert "using fallback signals" in caplog.text
 
 
 def test_dry_run_writes_report_without_database_or_jumpbox_writes(

@@ -32,6 +32,7 @@ class MatchSignals:
 
     catalog_item: str | None
     text: str | None
+    task_name: str | None = None
     category: str | None = None
     task_signature: TaskSignature | None = None
 
@@ -133,15 +134,12 @@ def score_similarity(
                         "task_signature",
                     ),
                 )
-                if error_similarity < 0.75:
-                    return ScoreResult(None, error_similarity, evidence)
-                if not _pre_analysis_text_is_specific(
+                if error_similarity >= 0.75 and _pre_analysis_text_is_specific(
                     left_signature.normalized_error,
                     right_signature.normalized_error,
                     same_catalog=True,
                 ):
-                    return ScoreResult(None, error_similarity, evidence)
-                return ScoreResult("high", error_similarity, evidence)
+                    return ScoreResult("high", error_similarity, evidence)
 
     similarity = text_similarity(left_text, right_text)
     left_catalog = _clean(left.catalog_item)

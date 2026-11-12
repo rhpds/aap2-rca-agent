@@ -86,10 +86,20 @@ class ReportHistoricalMatch(SemanticMatch):
     pattern_id: str = None
 
 
+class TaskSignatureRecord(SchemaModel):
+    play: str
+    role: str
+    task: str
+    task_action: str
+    task_path: str
+    error_message: str
+
+
 class JobSummary(SchemaModel):
     job_id: str
     status: Literal["analyzed", "failed", "matched_known_issue"]
     result_id: JsonInteger = None
+    task_name: str = None
     root_cause_category: Category = None
     confidence: Confidence = None
     root_cause_summary: str = None
@@ -101,6 +111,7 @@ class JobSummary(SchemaModel):
     failing_github_path: str = None
     analysis_path: str = None
     historical_matches: list[ReportHistoricalMatch] = None
+    task_signature: TaskSignatureRecord = None
 
 
 class FailedAnalysis(SchemaModel):

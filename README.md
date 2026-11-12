@@ -76,8 +76,12 @@ rca-batch --limit 15
 
 Use `--no-pre-filter` to skip matching jobs against recent known issues.
 The pre-analysis gate extracts the first failed Ansible task and matches its
-normalized signature; when task context is unavailable, it falls back to the
-catalog item and error text.
+normalized signature. Analyzed results persist the failed task name in
+`aap2_job_results.task_name` and its signature in the
+`aap2_job_results.task_signature` JSONB column, so later batches can shortlist
+historical failures by task and then compare signatures without reconstructing
+them from local artifacts. When task context is unavailable, the gate falls back
+to the catalog item and error text.
 `RCA_MAX_PARALLEL_JOBS` sets the bound for parallel job pipelines and Agent SDK
 queries (default `5`). The Step 6 Jira ticket preparation hook is intentionally
 a no-op for now; no Jira integration or ticket creation is performed.

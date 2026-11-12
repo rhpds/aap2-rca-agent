@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -36,6 +37,12 @@ def _normalize_error(value: Any) -> str:
     return _TIMESTAMP_PATTERN.sub("<timestamp>", normalized)
 
 
+def normalize_task_name(value: Any) -> str:
+    """Normalize an Ansible task name for candidate lookup."""
+
+    return _normalize_text(value)
+
+
 @dataclass(frozen=True)
 class TaskSignature:
     """A failed Ansible task's stable identity and normalized error."""
@@ -63,8 +70,63 @@ class TaskSignature:
 
     @property
     def is_complete(self) -> bool:
-        play, _role, task, task_action, task_path = self.identity_key
-        return all((play, task, task_action, task_path, self.normalized_error))
+        play, _role, task, task_action, _task_path = self.identity_key
+        return all((play, task, task_action, self.normalized_error))
+
+
+def task_signature_data(
+    value: TaskSignature | Mapping[str, Any] | None,
+) -> dict[str, str] | None:
+    """Return the stable JSON representation of a task signature."""
+
+    if value is None:
+        return None
+    if isinstance(value, TaskSignature):
+        fields = {
+            "play": value.play,
+            "role": value.role,
+            "task": value.task,
+            "task_action": value.task_action,
+            "task_path": value.task_path,
+            "error_message": value.error_message,
+        }
+    elif isinstance(value, Mapping):
+        fields = {
+            "play": value.get("play"),
+            "role": value.get("role"),
+            "task": value.get("task"),
+            "task_action": value.get("task_action"),
+            "task_path": value.get("task_path"),
+            "error_message": value.get("error_message"),
+        }
+    else:
+        return None
+    return {key: str(field or "") for key, field in fields.items()}
+
+
+def task_signature_from_data(value: Mapping[str, Any] | None) -> TaskSignature | None:
+    """Build a task signature from its JSON-compatible representation."""
+
+    data = task_signature_data(value)
+    if data is None:
+        return None
+    return TaskSignature(**data)
+
+
+def deserialize_task_signature(value: Any) -> TaskSignature | None:
+    """Parse a signature from a JSONB mapping or JSON text value."""
+
+    if isinstance(value, Mapping):
+        return task_signature_from_data(value)
+    if not isinstance(value, str):
+        return None
+    try:
+        data = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, Mapping):
+        return None
+    return task_signature_from_data(data)
 
 
 def build_task_signature(context: Mapping[str, Any] | None) -> TaskSignature | None:

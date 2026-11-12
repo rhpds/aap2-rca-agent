@@ -73,6 +73,15 @@ def _report() -> dict:
             {
                 "job_id": "101",
                 "status": "analyzed",
+                "task_name": "Install dependencies",
+                "task_signature": {
+                    "play": "Setup",
+                    "role": "common",
+                    "task": "Install dependencies",
+                    "task_action": "yum",
+                    "task_path": "/roles/common/tasks/main.yml",
+                    "error_message": "Worker timed out",
+                },
                 "historical_matches": [{**match, "recurrence_count": 2}],
             }
         ],
@@ -124,6 +133,7 @@ def test_batch_models_preserve_open_properties_and_omitted_fields(model, payload
         (("job_summaries", 0, "confidence"), "invalid"),
         (("job_summaries", 0, "result_id"), "9"),
         (("job_summaries", 0, "job_duration_seconds"), -1),
+        (("job_summaries", 0, "task_signature", "role"), 1),
         (("job_summaries", 0, "historical_matches", 0, "recurrence_count"), 0),
         (("job_summaries", 0, "historical_matches", 0, "confidence"), None),
         (("failed_analyses", 0, "stage"), "invalid"),
