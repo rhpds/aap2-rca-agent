@@ -13,8 +13,15 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+from rca.analysis import cost_estimate
 from rca.analysis.jumpbox_io import upload_to_jumpbox
-from rca.analysis.pipeline import AnalysisPipelineError, get_step_name, run_analysis
+from rca.analysis.pipeline import (
+    COST_ESTIMATE_FILENAME,
+    AnalysisPipelineError,
+    get_step_name,
+    run_analysis,
+    run_cost_estimate,
+)
 from rca.analysis.setup import find_repo_root, print_checks, run_checks
 from rca.analysis.splunk_client import SplunkClient
 from rca.config import Config
@@ -62,6 +69,42 @@ def cmd_analyze(args: argparse.Namespace, config: Config) -> int:
     print(f"Analysis directory: {artifacts.analysis_dir}")
     for step in range(1, 5):
         print(f"  - step{step}_{get_step_name(step)}.json")
+    cost = artifacts.cost_estimate or {}
+    print(f"  - {COST_ESTIMATE_FILENAME}")
+    if cost.get("skipped"):
+        print(f"Cost estimate: skipped ({cost.get('reason')})")
+    elif cost.get("estimate"):
+        est = cost["estimate"]
+        print(
+            f"Cost estimate: ${est['cost_mid']:,.2f} "
+            f"(range ${est['cost_low']:,.2f} - ${est['cost_high']:,.2f}, {est['confidence']} confidence)"
+        )
+    else:
+        print(f"Cost estimate: {cost.get('note', 'none')}")
+    return 0
+
+
+def cmd_cost(args: argparse.Namespace, config: Config) -> int:
+    analysis_dir = config.analysis_dir / args.job_id
+    context_path = analysis_dir / "step1_job_context.json"
+    job_context: dict[str, Any] = {}
+    if context_path.is_file():
+        job_context = json.loads(context_path.read_text(encoding="utf-8"))
+    elif not args.provision_uuid:
+        logger.error("No step1 for job %s; run analyze first or pass --provision-uuid", args.job_id)
+        return 1
+    result = run_cost_estimate(
+        config,
+        job_context,
+        analysis_dir,
+        provision_uuid=args.provision_uuid,
+        include_baseline=args.baseline,
+    )
+    if result.get("skipped"):
+        logger.error("[ERROR] %s", result["reason"])
+        return 1
+    print(cost_estimate.render(result))
+    print(f"\nSaved: {analysis_dir / COST_ESTIMATE_FILENAME}")
     return 0
 
 
@@ -113,7 +156,7 @@ def cmd_setup(config: Config, as_json: bool) -> int:
     else:
         issues = print_checks(results)
         return 0 if issues == 0 else 1
-    return 0 if all(item["status"] == "ok" for item in results) else 1
+    return 0 if all(item["status"] in ("ok", "skipped") for item in results) else 1
 
 
 def _run_mlflow_autolog(project_root: Path, environment: dict[str, str]) -> None:
@@ -188,6 +231,11 @@ def build_parser() -> argparse.ArgumentParser:
     setup = subparsers.add_parser("setup", help="Check prerequisites")
     setup.add_argument("--json", action="store_true", help="Output checks as JSON")
 
+    cost = subparsers.add_parser("cost", help="Estimate the cost of the failing provision")
+    cost.add_argument("--job-id", required=True)
+    cost.add_argument("--provision-uuid", help="Override the UUID taken from the job name")
+    cost.add_argument("--baseline", action="store_true", help="Also show the catalog baseline")
+
     status = subparsers.add_parser("status", help="Show saved analysis artifacts")
     status.add_argument("job_id")
 
@@ -213,6 +261,8 @@ def main(argv: list[str] | None = None) -> int:
         exit_code = cmd_query(args, config)
     elif args.command == "setup":
         exit_code = cmd_setup(config, args.json)
+    elif args.command == "cost":
+        exit_code = cmd_cost(args, config)
     elif args.command == "status":
         exit_code = cmd_status(args, config)
     elif args.command == "upload":

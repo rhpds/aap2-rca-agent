@@ -356,6 +356,34 @@ def check_github() -> dict:
     }
 
 
+def check_reporting_mcp() -> dict:
+    """Check the reporting MCP token used by the Step 4c cost estimate."""
+    token = os.environ.get("REPORTING_MCP_TOKEN", "")
+    if is_placeholder(token):
+        return {
+            "name": "Reporting MCP token",
+            "status": "skipped",  # optional: does not fail setup
+            "message": (
+                "REPORTING_MCP_TOKEN not configured; the cost estimate (Step 4c) will be "
+                "skipped. Set in .claude/settings.json"
+            ),
+            "env_vars": [
+                {
+                    "name": "REPORTING_MCP_TOKEN",
+                    "prompt": "Access token for the reporting-db-prod MCP server (cost estimate)",
+                },
+                {
+                    "name": "REPORTING_MCP_URL",
+                    "prompt": "Reporting MCP endpoint (optional, defaults to production)",
+                    "optional": True,
+                },
+            ],
+            "configurable": True,
+        }
+
+    return {"name": "Reporting MCP token", "status": "ok", "message": "configured"}
+
+
 def check_github_mcp(repo_root: Path) -> dict:
     """Check GitHub MCP server configuration."""
     mcp_path = repo_root / ".mcp.json"
@@ -685,6 +713,7 @@ def run_checks(base_dir: Path, repo_root: Path | None = None) -> list[dict]:
         check_ssh(),
         check_splunk(),
         check_github(),
+        check_reporting_mcp(),
         check_github_mcp(repo_root),
         check_mlflow(),
         check_mlflow_server(),
@@ -694,7 +723,7 @@ def run_checks(base_dir: Path, repo_root: Path | None = None) -> list[dict]:
 
 def print_checks(results: list[dict]) -> int:
     """Print check results in a human-readable format. Returns count of issues."""
-    icons = {"ok": "[ok]", "missing": "[!!]", "error": "[!!]"}
+    icons = {"ok": "[ok]", "skipped": "[--]", "missing": "[!!]", "error": "[!!]"}
     issues = 0
 
     print()
@@ -705,7 +734,7 @@ def print_checks(results: list[dict]) -> int:
         icon = icons.get(r["status"], "[??]")
         pad = 20 - len(r["name"])
         print(f"  {icon} {r['name']}{' ' * max(pad, 1)} {r['message']}")
-        if r["status"] != "ok":
+        if r["status"] not in ("ok", "skipped"):
             issues += 1
 
     print()

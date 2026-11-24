@@ -25,11 +25,14 @@ flowchart TD
       Splunk[Query Splunk]
       Correlation[Build correlation timeline]
       GitHub[Fetch AgnosticV config and AgnosticD code]
+      Cost[Step 4c: estimate failure cost from similar successful provisions]
       Synthesis[Agent SDK investigates and returns structured summary]
       Upload[Upload analysis to Jumpbox]
-      Parse --> Splunk --> Correlation --> GitHub --> Synthesis --> Upload
+      Parse --> Splunk --> Correlation --> GitHub --> Cost --> Synthesis --> Upload
     end
     Analysis --> Parse
+    ReportingDB[(Reporting database<br/>reporting-db-prod MCP server)]
+    Cost --> ReportingDB
     Upload --> Aggregate[Semantic aggregation: historical matches and cross-job patterns]
     Known --> Aggregate
     Aggregate --> Write[Write report JSON]
@@ -57,11 +60,19 @@ python3 -m venv .venv
 ```bash
 rca-analyze analyze --job-id 1234567 --fetch
 rca-analyze analyze --job-log /path/to/job.json.gz
+rca-analyze cost --job-id 1234567
+rca-analyze cost --job-id 1234567 --provision-uuid <uuid> --baseline
 rca-analyze parse --job-log /path/to/job.json.gz
 rca-analyze query 'index=ocp_apps "x1234"' --earliest=-24h
 rca-analyze status 1234567
 rca-analyze upload --job-id 1234567
 ```
+
+`analyze` runs the deterministic steps 1–4 and the Step 4c cost estimate (see
+[Cost estimate](#cost-estimate-step-4c)). `cost` re-runs only the estimate for a
+job that has already been analyzed; `--provision-uuid` overrides the UUID taken
+from the job name and `--baseline` also shows the catalog baseline as a
+cross-check.
 
 The CronJob runs `rca-batch` directly. The legacy
 `deploy/batch-rca-automation/batch_rca_headless.sh` path remains as a thin
@@ -121,6 +132,10 @@ Important settings include:
 - `SOURCE_DB_*` for the AAP source and results tables.
 - `JOB_LOGS_DIR`, `REMOTE_HOST`, and `REMOTE_DIR` for job-log retrieval.
 - `SPLUNK_*` and `GITHUB_TOKEN` for deterministic enrichment.
+- `REPORTING_MCP_TOKEN` (and optional `REPORTING_MCP_URL`) for the Step 4c cost
+  estimate against the reporting database. Without a token the step is recorded
+  as skipped. The Helm deployment does not set it by default.
+  `rca-analyze setup` reports whether it is set but does not fail without it.
 - `JUMPBOX_URI` for uploading completed analysis when using a direct SSH target.
 - Optional `SSH_JUMPBOX_ALIAS` to route uploads through a host configured in
   `~/.ssh/config` (the Helm cluster deployment uses `ci-jumpbox`). When set,
@@ -131,9 +146,10 @@ Important settings include:
 Batch reports are written to `$RCA_STATE_DIR/reports/`. Per-job artifacts are
 stored under `$RCA_STATE_DIR/.analysis/{job_id}/`.
 
-`rca.models` provides Pydantic models for all seven JSON artifact contracts.
+`rca.models` provides Pydantic models for all eight JSON artifact contracts.
 These define generated summaries, raw semantic aggregation responses, final
-batch reports, and assembled root-cause details. Per-job synthesis and semantic
+batch reports, assembled root-cause details, and the Step 4c cost estimate
+(`CostEstimateArtifact`). Per-job synthesis and semantic
 aggregation derive response schemas from `AnalysisSummary` and
 `BatchSemanticOutput` with `model_json_schema()` and pass them to the Agent SDK. There are
 no separately maintained JSON schema files. Models preserve rules for required
@@ -240,8 +256,41 @@ job gets its own result row. A cluster can therefore be read with a single
 equality query on `related_result_id` and does not require recursion.
 
 Per-job analysis files are saved under `$RCA_STATE_DIR/.analysis/{job_id}/`:
-job context, Splunk logs, the correlation timeline, GitHub fetch history, and
-the Step 5 analysis summary.
+job context, Splunk logs, the correlation timeline, GitHub fetch history, the
+Step 4c cost estimate, and the Step 5 analysis summary.
+
+## Cost estimate (Step 4c)
+
+After the GitHub fetch, the pipeline estimates what the failing provision cost
+and saves it as `step4c_cost_estimate.json`. The code is
+`src/rca/analysis/cost_estimate.py`. It reads the reporting database through the
+`reporting-db-prod` MCP server (read-only SQL over HTTP, see the architecture
+diagram); every number comes from SQL and nothing is left to model judgement.
+
+1. The provision UUID is taken from the job name in `step1_job_context.json`
+   (or `--provision-uuid`).
+2. `hours_failing` is `retired_at - provisioned_at` for that provision;
+   `provisioned_at` is a proxy for when the failure began.
+3. Comparable provisions are successful provisions of the same catalog item
+   retired in the window before `provisioned_at`. The window widens from 7 to 14
+   to 30 days until at least 3 match.
+4. If none match, a catalog baseline is used: the median cost per lifetime hour
+   of recent provisions of the catalog item, with outliers removed.
+5. `estimated cost = median cost per hour × hours_failing`, with the range from
+   the minimum and maximum cost per hour.
+
+Confidence is `high` for 10 or more comparisons in the 7-day window, `medium`
+for 3 to 9, and `low` for a wider window, fewer than 3, or the catalog baseline.
+The result is an estimate, not billed cost (cost data can lag a day or more).
+When the median equals the maximum it is flagged as skewed and the high end is
+not a true upper bound.
+
+The batch synthesis agent reads `step4c_cost_estimate.json` as optional context
+and quotes it verbatim in its summary; it never computes a cost itself and the
+estimate does not influence the root cause or confidence.
+
+The step never fails the analysis: with no UUID, no `REPORTING_MCP_TOKEN`, or an
+MCP error, it saves `{"skipped": true, "reason": ...}` and continues.
 
 ## Deployment and tests
 
